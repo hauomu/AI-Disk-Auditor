@@ -58,19 +58,26 @@ Run a deeper scan and generate a report:
 & ([scriptblock]::Create((irm "https://raw.githubusercontent.com/hauomu/AI-Disk-Auditor/main/windows/ai-disk-audit.ps1"))) -Comprehensive -Report
 ```
 
-#### Option 2 — Inspect first, then run
+### Option 2 — Portable (Review Source Before Running)
 
 For users who prefer to inspect the script before running it:
 
-1. Download `windows/ai-disk-audit.ps1`.
-2. Open the file in a text editor.
-3. Review what paths it scans.
-4. Open PowerShell in the download folder.
-5. Run:
+Download windows/ai-disk-audit.ps1
+Review the source code (optional but encouraged)
+Run locally:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\ai-disk-audit.ps1
 ```
+
+Best for:
+
+Users who prefer to inspect the source before execution.
+Offline use.
+Re-running the same version later.
+Organizations with internet restrictions.
+Security-conscious users.
+
 
 Generate a text report:
 
