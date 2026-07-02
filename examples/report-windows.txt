@@ -1,0 +1,4 @@
+AI Disk Auditor v1.0 - Windows
+
+12.34 GB  C:\Users\Example\.ollama
+7.06 GB   C:\Users\Example\AppData\Local\Temp
