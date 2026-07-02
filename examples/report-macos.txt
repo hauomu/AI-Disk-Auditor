@@ -1,0 +1,4 @@
+AI Disk Auditor v1.0 - Linux/macOS
+
+8.20 GB  /Users/example/.ollama
+3.10 GB  /Users/example/Library/Caches/mlx
