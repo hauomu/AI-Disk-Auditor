@@ -38,7 +38,35 @@ AI Disk Auditor is designed around five goals:
 
 ### Windows
 
-Download `windows/ai-disk-audit.ps1`, open PowerShell in that folder, then run:
+#### Option 1 — Run directly from GitHub
+
+This runs the Windows auditor directly from the raw GitHub script:
+
+```powershell
+& ([scriptblock]::Create((irm "https://raw.githubusercontent.com/hauomu/AI-Disk-Auditor/main/windows/ai-disk-audit.ps1")))
+```
+
+Generate a text report:
+
+```powershell
+& ([scriptblock]::Create((irm "https://raw.githubusercontent.com/hauomu/AI-Disk-Auditor/main/windows/ai-disk-audit.ps1"))) -Report
+```
+
+Run a deeper scan and generate a report:
+
+```powershell
+& ([scriptblock]::Create((irm "https://raw.githubusercontent.com/hauomu/AI-Disk-Auditor/main/windows/ai-disk-audit.ps1"))) -Comprehensive -Report
+```
+
+#### Option 2 — Inspect first, then run
+
+For users who prefer to inspect the script before running it:
+
+1. Download `windows/ai-disk-audit.ps1`.
+2. Open the file in a text editor.
+3. Review what paths it scans.
+4. Open PowerShell in the download folder.
+5. Run:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\ai-disk-audit.ps1
