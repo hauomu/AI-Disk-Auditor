@@ -1,0 +1,4 @@
+AI Disk Auditor v1.0 - Linux/macOS
+
+12.34 GB  /home/example/.ollama
+4.20 GB   /home/example/.cache/huggingface
