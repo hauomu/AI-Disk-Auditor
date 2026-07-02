@@ -38,7 +38,7 @@ AI Disk Auditor is designed around five goals:
 
 ### Windows
 
-#### Option 1 — Run directly from GitHub
+#### Option 1 — Run Directly from GitHub
 
 This runs the Windows auditor directly from the raw GitHub script:
 
@@ -58,13 +58,13 @@ Run a deeper scan and generate a report:
 & ([scriptblock]::Create((irm "https://raw.githubusercontent.com/hauomu/AI-Disk-Auditor/main/windows/ai-disk-audit.ps1"))) -Comprehensive -Report
 ```
 
-### Option 2 — Portable (Review Source Before Running)
+#### Option 2 — Portable (Review Source Before Running)
 
 For users who prefer to inspect the script before running it:
 
-Download windows/ai-disk-audit.ps1
-Review the source code (optional but encouraged)
-Run locally:
+- Download `windows/ai-disk-audit.ps1`.
+- Review the source code.
+- Run locally:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\ai-disk-audit.ps1
@@ -72,12 +72,11 @@ powershell -ExecutionPolicy Bypass -File .\ai-disk-audit.ps1
 
 Best for:
 
-Users who prefer to inspect the source before execution.
-Offline use.
-Re-running the same version later.
-Organizations with internet restrictions.
-Security-conscious users.
-
+- Users who prefer to inspect the source before execution.
+- Offline use.
+- Re-running the same version later.
+- Organizations with internet restrictions.
+- Security-conscious users.
 
 Generate a text report:
 
@@ -93,7 +92,34 @@ powershell -ExecutionPolicy Bypass -File .\ai-disk-audit.ps1 -Comprehensive
 
 ### Linux / macOS
 
-Download `linux/ai-disk-audit.sh`, open a terminal in that folder, then run:
+#### Option 1 — Run Directly from GitHub
+
+This downloads the Bash auditor from GitHub and runs it immediately:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/hauomu/AI-Disk-Auditor/main/linux/ai-disk-audit.sh)
+```
+
+Generate a text report:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/hauomu/AI-Disk-Auditor/main/linux/ai-disk-audit.sh) --report
+```
+
+Run a deeper scan and generate a report:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/hauomu/AI-Disk-Auditor/main/linux/ai-disk-audit.sh) --comprehensive --report
+```
+
+#### Option 2 — Portable (Review Source Before Running)
+
+For users who prefer to inspect the script before running it:
+
+- Download `linux/ai-disk-audit.sh`.
+- Review the source code.
+- Open a terminal in the download folder.
+- Run locally:
 
 ```bash
 chmod +x ./ai-disk-audit.sh
