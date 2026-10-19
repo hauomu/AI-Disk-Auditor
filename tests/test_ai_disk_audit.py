@@ -34,9 +34,14 @@ class AuditorBehavior(unittest.TestCase):
         self.env.update({"HOME": bash_path(self.home), "XDG_CACHE_HOME": bash_path(self.home / ".cache")})
         for name in ("AI_AUDIT_MODEL_ROOT", "AI_AUDIT_STRATA_ROOT", "OLLAMA_MODELS", "HF_HOME", "HF_HUB_CACHE"):
             self.env.pop(name, None)
+        for name in ("XDG_DATA_HOME", "HF_XET_CACHE", "HF_ASSETS_CACHE", "HUGGINGFACE_HUB_CACHE",
+                     "TORCH_HOME", "PIP_CACHE_DIR", "UV_CACHE_DIR", "TRITON_CACHE_DIR", "CUDA_CACHE_PATH",
+                     "HIP_CACHE_DIR", "ROCM_CACHE_DIR", "HSA_CACHE_DIR", "MIOPEN_CUSTOM_CACHE_DIR",
+                     "MIOPEN_USER_DB_PATH", "CCACHE_DIR", "SCCACHE_DIR", "npm_config_cache", "BASH_ENV"):
+            self.env.pop(name, None)
 
     def run_script(self, args=(), stream=False, env=None):
-        command = [BASH, "-s", "--", *args] if stream else [BASH, str(SCRIPT), *args]
+        command = [BASH, "-s", "--", "--home-only", *args] if stream else [BASH, str(SCRIPT), "--home-only", *args]
         source = SCRIPT.read_bytes() if stream else None
         return subprocess.run(command, input=source, capture_output=True, env=env or self.env, text=False)
 
@@ -53,7 +58,7 @@ class AuditorBehavior(unittest.TestCase):
         self.assertEqual(list(self.base.rglob("*.txt")), [])
 
     def test_process_substitution_invocation(self):
-        command = 'bash <(cat "$1") --root "$2"'
+        command = 'bash <(cat "$1") --home-only --root "$2"'
         result = subprocess.run(
             [BASH, "-c", command, "process-substitution", bash_path(SCRIPT), bash_path(self.root)],
             capture_output=True,
@@ -73,7 +78,7 @@ class AuditorBehavior(unittest.TestCase):
         result = self.run_script(("--root", bash_path(self.root),), env=env)
         output = result.stdout.decode(errors="replace")
         self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
-        self.assertIn("ALIAS", output)
+        self.assertIn("Resolved directory links:", output)
         self.assertIn("models\\ with\\ spaces", output)
 
     @unittest.skipIf(os.name == "nt", "Git Bash on Windows cannot reliably pass newline paths through CreateProcess argv")
@@ -131,8 +136,77 @@ class AuditorBehavior(unittest.TestCase):
         result = self.run_script(("--root", bash_path(self.root)), env=env)
         output = result.stdout.decode(errors="replace")
         self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
-        self.assertIn("ERROR", output)
-        self.assertIn("incomplete", output.lower())
+        self.assertIn("UNREADABLE", output)
+        self.assertIn("could not be completely sized", output)
+
+    def rows(self, output):
+        return [line for line in output.splitlines()
+                if any(status in line for status in ("  OK ", "  PARTIAL ", "  UNREADABLE "))]
+
+    def test_server_workspaces_and_python_installations_are_discovered(self):
+        for name in ("strata-stage1/prod/models", ".unsloth/venv", "ai/comfyui/.venv",
+                     ".local/share/uv/python", ".cache/comgr"):
+            directory = self.home / name
+            directory.mkdir(parents=True)
+            (directory / "fixture.bin").write_bytes(b"x" * 8192)
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = "\n".join(self.rows(result.stdout.decode()))
+        for name in ("strata-stage1", ".unsloth", "/ai", ".local/share/uv", ".cache/comgr"):
+            self.assertIn(name, rows)
+
+    def test_huggingface_is_sized_once_without_self_alias_or_nested_rows(self):
+        hub = self.home / ".cache" / "huggingface" / "hub"
+        hub.mkdir(parents=True)
+        (hub / "blob.bin").write_bytes(b"x" * 16384)
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = result.stdout.decode()
+        hf_rows = [row for row in self.rows(output) if "huggingface" in row]
+        self.assertEqual(len(hf_rows), 1, output)
+        self.assertNotIn("/huggingface/hub", hf_rows[0])
+        self.assertNotIn("Resolved directory links:", output)
+
+    def test_shared_storage_discovers_ai_folders_without_sizing_unrelated_data(self):
+        storage = self.base / "storage"
+        for name in ("llm-nvme/models", "llm-nvme/hf-cache", "comfy-sata/comfyui/.venv", "other/photos"):
+            directory = storage / name
+            directory.mkdir(parents=True)
+            (directory / "fixture.bin").write_bytes(b"x" * 8192)
+        result = self.run_script(("--storage-root", bash_path(storage)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = "\n".join(self.rows(result.stdout.decode()))
+        for name in ("llm-nvme/models", "llm-nvme/hf-cache", "comfy-sata/comfyui"):
+            self.assertIn(name, rows)
+        self.assertNotIn("photos", rows)
+        self.assertNotIn("/other", rows)
+
+    def test_partial_scan_retains_readable_size(self):
+        hook = self.base / "partial-du.sh"
+        hook.write_text('du() { printf "1048576\\t%s\\n" "$2"; return 1; }\n', encoding="utf-8", newline="\n")
+        env = self.env.copy()
+        env["BASH_ENV"] = bash_path(hook)
+        result = self.run_script(("--root", bash_path(self.root)), env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = self.rows(result.stdout.decode())
+        self.assertTrue(any("1.00" in row and "PARTIAL" in row for row in rows), rows)
+
+    def test_sizes_are_sorted_largest_first(self):
+        big = self.base / "big store"
+        big.mkdir()
+        (big / "weights.bin").write_bytes(b"x" * 2 * 1024 * 1024)
+        result = self.run_script(("--root", bash_path(self.root), "--root", bash_path(big)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = self.rows(result.stdout.decode())
+        big_index = next(i for i, row in enumerate(rows) if "big\\ store" in row)
+        small_index = next(i for i, row in enumerate(rows) if "models\\ with\\ spaces" in row)
+        self.assertLess(big_index, small_index)
+
+    def test_missing_configured_root_and_empty_options_are_visible(self):
+        result = self.run_script(("--root", bash_path(self.base / "missing")))
+        self.assertIn(b"Missing/inaccessible", result.stdout)
+        invalid = self.run_script(("--report-path", ""))
+        self.assertNotEqual(invalid.returncode, 0)
 
 
 if __name__ == "__main__":
