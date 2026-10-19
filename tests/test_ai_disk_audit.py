@@ -37,7 +37,8 @@ class AuditorBehavior(unittest.TestCase):
         for name in ("XDG_DATA_HOME", "HF_XET_CACHE", "HF_ASSETS_CACHE", "HUGGINGFACE_HUB_CACHE",
                      "TORCH_HOME", "PIP_CACHE_DIR", "UV_CACHE_DIR", "TRITON_CACHE_DIR", "CUDA_CACHE_PATH",
                      "HIP_CACHE_DIR", "ROCM_CACHE_DIR", "HSA_CACHE_DIR", "MIOPEN_CUSTOM_CACHE_DIR",
-                     "MIOPEN_USER_DB_PATH", "CCACHE_DIR", "SCCACHE_DIR", "npm_config_cache", "BASH_ENV"):
+                     "MIOPEN_USER_DB_PATH", "CCACHE_DIR", "SCCACHE_DIR", "npm_config_cache", "BASH_ENV",
+                     "HF_DATASETS_CACHE", "UV_PYTHON_INSTALL_DIR", "UV_TOOL_DIR", "VLLM_CACHE_ROOT"):
             self.env.pop(name, None)
 
     def run_script(self, args=(), stream=False, env=None):
@@ -207,6 +208,38 @@ class AuditorBehavior(unittest.TestCase):
         self.assertIn(b"Missing/inaccessible", result.stdout)
         invalid = self.run_script(("--report-path", ""))
         self.assertNotEqual(invalid.returncode, 0)
+
+    def test_unrelated_folders_do_not_exhaust_project_discovery(self):
+        for i in range(240): (self.home/f'000-unrelated-{i:03}').mkdir()
+        project=self.home/'vllm-portable-workspace'; project.mkdir()
+        result=self.run_script(('--list-roots','--diagnostics'))
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn(b'vllm-portable-workspace',result.stdout)
+        self.assertIn(b'traversals=0',result.stdout)
+
+    def test_relocated_dataset_and_managed_python_install(self):
+        dataset=self.base/'external-datasets'; dataset.mkdir()
+        python=self.base/'managed-python'; python.mkdir()
+        env=self.env.copy(); env['HF_DATASETS_CACHE']=bash_path(dataset); env['UV_PYTHON_INSTALL_DIR']=bash_path(python)
+        result=self.run_script(('--list-roots',),env=env)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn(b'external-datasets',result.stdout)
+        self.assertIn(b'managed-python',result.stdout)
+
+    def test_flat_root_planning_does_not_walk_files_or_probe_filesystems(self):
+        peer=self.base/'another store'; peer.mkdir()
+        result=self.run_script(('--root',bash_path(self.root),'--root',bash_path(peer),'--list-roots','--diagnostics'))
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn(b'traversals=0 filesystem_probes=0',result.stdout)
+
+    def test_nested_roots_reuse_parent_device_identity(self):
+        args=['--root',bash_path(self.root),'--list-roots','--diagnostics']
+        for i in range(24):
+            child=self.root/f'child-{i}'; child.mkdir()
+            args.extend(['--root',bash_path(child)])
+        result=self.run_script(args)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn(b'traversals=0 filesystem_probes=25',result.stdout)
 
 
 if __name__ == "__main__":
