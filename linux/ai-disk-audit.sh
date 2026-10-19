@@ -5,6 +5,8 @@ set +e
 
 COMPREHENSIVE=false
 HOME_ONLY=false
+LIST_ROOTS=false
+DIAGNOSTICS=false
 LEGACY_REPORT=false
 REPORT_PATH=
 MODEL_ROOT=${AI_AUDIT_MODEL_ROOT:-}
@@ -15,6 +17,8 @@ CUSTOM_ROOTS=(); STORAGE_ROOTS=()
 SELECTED_PATHS=(); SELECTED_GROUPS=(); SELECTED_LABELS=()
 ALIASES=(); ISSUES=()
 COVERED=0
+DEVICE_PROBES=0
+MEASUREMENTS=0
 
 usage() {
   cat <<'EOF'
@@ -28,6 +32,8 @@ Usage: bash ai-disk-audit.sh [options]
       --strata-root DIR  Include a Strata workspace (or AI_AUDIT_STRATA_ROOT)
       --storage-root DIR Look for AI folders below a storage parent (repeatable)
       --home-only        Skip automatic system/shared-storage discovery
+      --list-roots       Show selected roots without measuring file trees
+      --diagnostics      Show traversal counts and planning statistics
   -h, --help             Show this help
 
 Quick mode includes known model/cache locations, named AI projects, Python
@@ -43,6 +49,8 @@ while [ "$#" -gt 0 ]; do
     -c|--comprehensive) COMPREHENSIVE=true; shift ;;
     -r|--report) LEGACY_REPORT=true; shift ;;
     --home-only) HOME_ONLY=true; shift ;;
+    --list-roots) LIST_ROOTS=true; shift ;;
+    --diagnostics) DIAGNOSTICS=true; shift ;;
     --root|--storage-root|--model-root|--strata-root|--report-path)
       need_value "$1" "$#" "${2:-}"
       case "$1" in
@@ -79,7 +87,7 @@ configured_root() {
 }
 is_ai_name() {
   case "$1" in
-    *model*|*Model*|strata*|Strata*|llama*|Llama*|vllm*|vLLM*|sglang*|SGLang*|\
+    AI|ai|*model*|*Model*|strata*|Strata*|llama*|Llama*|vllm*|vLLM*|sglang*|SGLang*|\
     *comfy*|*Comfy*|*unsloth*|*Unsloth*|hf-cache*|huggingface*|lmstudio*|\
     ollama*|llm*|LLM*|*-llm*|*rocm*|*ROCm*|stable-diffusion*) return 0 ;;
     *) return 1 ;;
@@ -89,10 +97,12 @@ discover_projects() {
   local parent=$1 p name count=0
   [ -d "$parent" ] || return
   for p in "$parent"/*; do
-    [ -d "$p" ] || continue
-    count=$((count+1)); [ "$count" -le 200 ] || break
     name=${p##*/}
-    is_ai_name "$name" && add_workspace "$p"
+    is_ai_name "$name" || continue
+    [ -d "$p" ] || continue
+    count=$((count+1))
+    if [ "$count" -gt 200 ]; then ISSUES[${#ISSUES[@]}]="Discovery limit reached (200 matching projects): $parent; use --root for more"; break; fi
+    add_workspace "$p"
   done
 }
 add_workspace() {
@@ -105,29 +115,32 @@ add_workspace() {
 }
 discover_storage() {
   # Storage parent -> volume/project -> named AI directories. No recursive find.
-  local parent=$1 p child name found count=0 inner
+  local parent=$1 depth=${2:-1} p child name found count=0 inner
   [ -d "$parent" ] || return
   for p in "$parent"/*; do
     [ -d "$p" ] || continue
-    count=$((count+1)); [ "$count" -le 200 ] || break
+    count=$((count+1))
+    if [ "$count" -gt 200 ]; then ISSUES[${#ISSUES[@]}]="Discovery limit reached (200 storage containers): $parent; use --storage-root for more"; break; fi
     case "${p##*/}" in
       models|Models|hf-cache*|huggingface*|lmstudio*|ollama*)
         add_root Storage 'Shared model store' "$p"; continue ;;
-      comfyui*|ComfyUI*|strata*|llama.cpp*|unsloth*|vllm*|sglang*|llm-lab*)
+      comfyui*|ComfyUI*|strata*|llama.cpp*|unsloth*|vllm*|sglang*)
         add_workspace "$p"; continue ;;
     esac
     found=false; inner=0
     for child in "$p"/*; do
-      [ -d "$child" ] || continue
-      inner=$((inner+1)); [ "$inner" -le 200 ] || break
       name=${child##*/}
-      if is_ai_name "$name"; then
+      if is_ai_name "$name" && [ -d "$child" ]; then
+        inner=$((inner+1))
+        if [ "$inner" -gt 200 ]; then ISSUES[${#ISSUES[@]}]="Discovery limit reached (200 matching stores): $p; use --root for more"; break; fi
         add_root Storage 'Shared model / AI workspace' "$child"; found=true
       fi
     done
     # A direct model store/project may have weights at its root.
     if [ "$found" = false ] && is_ai_name "${p##*/}"; then
       add_root Storage 'Shared model / AI workspace' "$p"
+    elif [ "$found" = false ] && [ "$depth" -gt 1 ]; then
+      discover_storage "$p" "$((depth-1))"
     fi
   done
 }
@@ -143,9 +156,13 @@ configured_root Caches 'Hugging Face models / datasets / assets' HF_HOME "$CACHE
 configured_root Caches 'Hugging Face Hub (custom location)' HF_HUB_CACHE "${HUGGINGFACE_HUB_CACHE:-$HF/hub}"
 configured_root Caches 'Hugging Face Xet chunks' HF_XET_CACHE "$HF/xet"
 configured_root Caches 'Hugging Face assets' HF_ASSETS_CACHE "$HF/assets"
+configured_root Caches 'Hugging Face datasets' HF_DATASETS_CACHE "$HF/datasets"
 configured_root Caches 'Torch / checkpoints / extensions' TORCH_HOME "$CACHE/torch"
 configured_root Caches 'pip downloads / wheels' PIP_CACHE_DIR "$CACHE/pip"
 configured_root Caches 'uv downloads / environments' UV_CACHE_DIR "$CACHE/uv"
+configured_root Caches 'vLLM cache' VLLM_CACHE_ROOT "$CACHE/vllm"
+configured_root Environments 'uv Python installations' UV_PYTHON_INSTALL_DIR "$DATA/uv/python"
+configured_root Environments 'uv tools' UV_TOOL_DIR "$DATA/uv/tools"
 configured_root Caches 'Triton kernels' TRITON_CACHE_DIR "$HOME/.triton/cache"
 configured_root Caches 'CUDA compiled kernels' CUDA_CACHE_PATH "$HOME/.nv/ComputeCache"
 configured_root Caches 'HIP compiled kernels' HIP_CACHE_DIR "$CACHE/hip"
@@ -173,7 +190,9 @@ for p in "$HOME/AI" "$HOME/ai" "$HOME/Models" "$HOME/models" "$HOME/llm" "$HOME/
 done
 for p in "$HOME" "$HOME/src" "$HOME/projects" "$HOME/workspace" "$HOME/.local/opt" "$DATA"; do discover_projects "$p"; done
 if [ "$HOME_ONLY" = false ]; then
-  for p in /mnt /media /srv /data; do discover_storage "$p"; done
+  for p in /mnt /srv /data; do discover_storage "$p"; done
+  discover_storage /media 2
+  [ "$OS_NAME" = Darwin ] && discover_storage /Volumes
   for p in /models /data/models /var/lib/ollama /usr/share/ollama/.ollama/models /usr/local/share/ollama; do
     add_root Models 'System model store' "$p"
   done
@@ -208,9 +227,19 @@ if [ "$COMPREHENSIVE" = true ]; then
 fi
 
 canonical_dir() ( cd -P -- "$1" 2>/dev/null && printf '%s.' "$PWD"; )
+filesystem_id() {
+  local value
+  if command -v stat >/dev/null 2>&1; then
+    if [ "$OS_NAME" = Darwin ]; then value=$(stat -f %d "$1" 2>/dev/null)
+    else value=$(stat -c %d -- "$1" 2>/dev/null); fi
+    if [ -n "$value" ]; then printf 'stat:%s' "$value"; return; fi
+  fi
+  value=$(df -P "$1" 2>/dev/null | awk 'END {if(NR>1)print $1}')
+  [ -n "$value" ] && printf 'df:%s' "$value"
+}
 prepare_roots() {
   local i j raw path seen parent
-  local candidates=() groups=() labels=()
+  local candidates=() groups=() labels=() devices=()
   for ((i=0; i<${#PATHS[@]}; i++)); do
     raw=${PATHS[$i]}
     if [ ! -d "$raw" ]; then
@@ -227,6 +256,7 @@ prepare_roots() {
     fi
     [ "$seen" = true ] && continue
     j=${#candidates[@]}; candidates[$j]=$path; groups[$j]=${GROUPS_LIST[$i]}; labels[$j]=${LABELS[$i]}
+    devices[$j]='__pending__'
   done
   for ((i=0; i<${#candidates[@]}; i++)); do
     path=${candidates[$i]}; seen=false
@@ -235,12 +265,14 @@ prepare_roots() {
       parent=${candidates[$j]%/}
       case "$path" in "$parent"/*)
         # Keep a separately mounted child: du -x on its parent excludes it.
-        if command -v df >/dev/null 2>&1; then
-          local child_fs parent_fs
-          child_fs=$(df -P "$path" 2>/dev/null | awk 'END {print $1}')
-          parent_fs=$(df -P "${candidates[$j]}" 2>/dev/null | awk 'END {print $1}')
-          [ -n "$child_fs" ] && [ "$child_fs" = "$parent_fs" ] && seen=true
-        fi ;;
+        # Probe only overlapping candidates, caching each identity once.
+        if [ "${devices[$i]}" = '__pending__' ]; then
+          devices[$i]=$(filesystem_id "$path"); DEVICE_PROBES=$((DEVICE_PROBES+1))
+        fi
+        if [ "${devices[$j]}" = '__pending__' ]; then
+          devices[$j]=$(filesystem_id "${candidates[$j]}"); DEVICE_PROBES=$((DEVICE_PROBES+1))
+        fi
+        [ -n "${devices[$i]}" ] && [ "${devices[$i]}" = "${devices[$j]}" ] && seen=true ;;
       esac
     done
     if [ "$seen" = true ]; then COVERED=$((COVERED+1)); continue; fi
@@ -271,8 +303,15 @@ scan() {
   printf 'Read-only audit of model stores, caches, AI workspaces and environments.\n'
   if [ "$COMPREHENSIVE" = true ]; then printf 'Mode: comprehensive (includes SDK/toolchain/container folders)\n'; else printf 'Mode: quick (use --comprehensive for SDK/toolchain/container sizes)\n'; fi
   prepare_roots
-  printf '\nMeasuring %s distinct directories; %s nested locations included in their parents.\n' "${#SELECTED_PATHS[@]}" "$COVERED"
+  printf '\nSelected %s distinct directories; %s nested locations included in their parents.\n' "${#SELECTED_PATHS[@]}" "$COVERED"
+  if [ "$LIST_ROOTS" = true ]; then
+    for ((i=0; i<${#SELECTED_PATHS[@]}; i++)); do printf 'ROOT\t%s\t%q\n' "${SELECTED_GROUPS[$i]}" "${SELECTED_PATHS[$i]}"; done
+    for raw in "${ISSUES[@]}"; do printf 'ISSUE %q\n' "$raw"; done
+    if [ "$DIAGNOSTICS" = true ]; then printf 'DIAGNOSTICS roots=%s traversals=0 filesystem_probes=%s\n' "${#SELECTED_PATHS[@]}" "$DEVICE_PROBES"; fi
+    return
+  fi
   for ((i=0; i<${#SELECTED_PATHS[@]}; i++)); do
+    MEASUREMENTS=$((MEASUREMENTS+1))
     raw=$(du -skx "${SELECTED_PATHS[$i]}" 2>/dev/null); rc=$?
     kb=$(printf '%s\n' "$raw" | awk 'NR==1 && $1 ~ /^[0-9]+$/ {print $1}')
     status=OK
@@ -311,6 +350,7 @@ scan() {
     df -iP "$HOME" "${SELECTED_PATHS[@]}" 2>&1 | awk '!seen[$0]++'
   else printf 'df unavailable\n'; fi
   printf '\nDiscovery is limited to known locations and named AI folders. Use --root DIR for unlisted stores.\n'
+  if [ "$DIAGNOSTICS" = true ]; then printf 'DIAGNOSTICS roots=%s traversals=%s filesystem_probes=%s\n' "${#SELECTED_PATHS[@]}" "$MEASUREMENTS" "$DEVICE_PROBES"; fi
 }
 
 if [ "$LEGACY_REPORT" = true ]; then

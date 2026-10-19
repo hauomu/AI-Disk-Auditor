@@ -1,53 +1,95 @@
-# AI Disk Auditor notes
+# AI Disk Auditor: portable Windows and Linux refactor
 
-The Linux/macOS entry point remains the single standalone Bash file at
-`linux/ai-disk-audit.sh`. It supports direct execution and streamed execution,
-for example `bash <(curl -fsSL https://raw.githubusercontent.com/hauomu/AI-Disk-Auditor/main/linux/ai-disk-audit.sh)`.
-It has no Python dependency, adjacent runtime files, installation step, or
-download at runtime.
+The product goal is useful AI-storage coverage with low search/traversal cost
+on different Windows and Linux installations, especially Linux LLM servers.
+Artemis is one validation host; its folder names, hardware and timings are not
+the specification. Defaults follow ecosystem conventions and environment
+overrides. Arbitrary locations remain available through explicit roots.
 
-Quick mode checks model stores, download/compiler caches, named AI projects,
-and environments. This includes LM Studio's downloaded runtimes, uv-managed
-Python installations, Unsloth, Strata, llama.cpp, ComfyUI, vLLM and SGLang
-workspaces. Named AI directories on shared storage below `/mnt`, `/media`,
-`/srv`, and `/data` are discovered without scanning entire disks. Discovery
-lists at most 200 child directories per parent, at bounded depth. It never
-opens project files, service configuration, credentials or model contents.
+## Existing script-block workflows
 
-`--comprehensive` additionally measures GPU SDKs (including versioned ROCm and
-CUDA installations), toolchains and container data folders. Restricted paths
-are reported without sudo or daemon queries. Quick mode still lists detected
-tools/SDK locations without starting them. Filesystem capacity and inode
-statistics cover the selected storage locations, not just the home disk.
+Windows PowerShell 5.1 / PowerShell 7 on Windows:
 
-`--root DIR` includes a specific directory; `--storage-root DIR` discovers named
-AI folders below a storage parent. Both are repeatable. `--model-root` and
-`--strata-root` override `AI_AUDIT_MODEL_ROOT` and `AI_AUDIT_STRATA_ROOT`.
-`--home-only` disables automatic shared/system discovery; explicitly supplied
-roots are still included. The scanner honors XDG cache/data locations and the
-supported Hugging Face, Ollama, Torch, pip, uv, Triton and GPU compiler cache
-environment variables. Use `--root` for arbitrary names or deeper layouts.
+```powershell
+& ([scriptblock]::Create((irm "https://raw.githubusercontent.com/hauomu/AI-Disk-Auditor/main/windows/ai-disk-audit.ps1")))
+```
 
-Reports are optional: `--report` / `-r` retain the timestamped report location;
-`--report-path FILE` chooses a new destination. Existing paths are refused.
-The largest directories appear first with category and status. Aliases are
-resolved, identical targets are scanned once, and nested roots on the same
-filesystem are included in their parent rather than listed again. Explicitly
-selected children on different filesystems remain separate because `du -x`
-excludes them from their parent. Interior symlinks are not traversed; selected
-model-store/environment links are resolved as roots. Hard links across rows
-may share storage, so rows are not additive or reclaimable totals. `PARTIAL`
-retains readable bytes from an incomplete scan; `UNREADABLE` is not zero.
+Linux Bash (the macOS entry point is retained):
 
-No service APIs, sudo, secrets, broad temporary trees, or whole-cache recursion
-are used. Container data is measured only in comprehensive mode and may be
-inaccessible. `README.md` remains append-only per project
-instructions; user-facing direction and implementation details belong here.
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/hauomu/AI-Disk-Auditor/main/linux/ai-disk-audit.sh)
+```
 
-The fixture behavior checks live in `tests/test_ai_disk_audit.py`. They require
-Python only as a development-host test orchestrator and Git Bash on Windows;
-the auditor itself requires only Bash and standard utilities. All 13 behavior
-tests pass on native Linux (Artemis, GNU Bash 5.3.9). Windows Git Bash passes 12
-tests and skips the newline-path case. A real read-only Artemis quick scan also
-verifies shared-storage, Strata, Unsloth, uv and multi-filesystem coverage.
-Native macOS/Bash 3.2 remains unverified.
+Both scripts remain standalone. There are no adjacent runtime files, third-party
+packages, install steps, default daemon queries, or cleanup actions.
+
+## Coverage and search cost
+
+- Windows uses profile/AppData/ProgramData/ProgramFiles locations supplied by the
+  operating environment, and checks fixed-drive roots for named AI directories.
+  It does not assume models live on `C:` and does not enumerate all drive trees.
+- Linux uses XDG cache/data conventions, standard model stores, shallow project
+  discovery and shared-storage parents. Broad temporary/cache trees are excluded.
+  Unrelated directory names no longer exhaust its project-discovery budget.
+  Actual discovery limits are reported when reached. macOS adds `/Volumes`.
+- Both honor supported relocated Hugging Face, Ollama, uv, Torch and compiler
+  cache roots. uv's platform locations follow its [storage reference](https://docs.astral.sh/uv/reference/storage/):
+  Windows cache is under LocalAppData, and managed Python is under Roaming
+  AppData. Explicit uv cache/Python/tool overrides take precedence.
+- [Hugging Face dataset caches](https://huggingface.co/docs/datasets/cache)
+  and custom vLLM cache roots can be separate from model download storage.
+- Roots are canonicalized and deduplicated before recursive measurements.
+  Covered child roots are removed. Explicit root links are resolved; interior
+  links/junctions are skipped so they cannot create traversal loops.
+- Linux queries filesystem identity only when roots overlap and caches each
+  result. Separately mounted children remain visible because `du -x` excludes
+  them from their parents. Flat roots need no identity probes.
+- Windows traverses cached filesystem metadata in a built-in .NET enumerator,
+  avoiding a PowerShell provider/pipeline operation per file. A provider fallback
+  handles unavailable native compilation. No background service or helper DLL
+  needs installing. It does not invoke Ollama/Foundry or launch Notepad.
+
+## Scope and diagnostics
+
+Windows adds `-Root`, `-StorageRoot`, `-ModelRoot`, `-StrataRoot`, `-HomeOnly`,
+`-ListRoots`, `-Diagnostics`, and `-ReportPath`. Existing `-Comprehensive` and
+`-Report` remain valid. Linux has the corresponding kebab-case options such as
+`--root`, `--storage-root`, `--home-only`, `--list-roots`, and `--diagnostics`.
+
+List-roots mode performs no recursive size measurements. Use it to inspect
+coverage before a full audit. Diagnostics exposes root/traversal counts; it is
+also used to test that duplicate roots do not cause duplicate walks. Home-only
+mode skips automatic shared/system discovery, while explicit roots still apply.
+
+Comprehensive mode adds SDKs, toolchains and container data directories; it
+never contacts container daemons or elevates privileges. Permission failures
+remain visible. Unknown application names or deeper layouts need explicit roots.
+
+## Report semantics
+
+Results are sorted largest first and marked OK, PARTIAL or UNREADABLE as
+appropriate. Windows sums apparent file lengths per directory entry; hard links
+can count repeatedly. Linux reports allocated blocks through `du`, which
+deduplicates hard links within each invocation. These measures differ, and
+neither is an aggregate reclaimable-byte estimate. Cross-row sharing is not
+reconciled. Missing/inaccessible configured roots are reported.
+
+Reports are optional and refuse existing destinations. `-Report` / `--report`
+retain the timestamped `AI-Disk-Audit-Reports` directory. Custom report-path
+options choose a new file. Scanned application data and settings are never written.
+
+## Validation and limits
+
+Tests cover varied fixture layouts: redirected model/dataset/cache/runtime
+paths, secondary storage, literal paths, aliases, link cycles, nested roots,
+more than 200 unrelated directories, partial scans and report collisions.
+Native Linux passes 17 cases. Windows passes six PowerShell behavior cases,
+including script-block execution in Windows PowerShell 5.1 and PowerShell 7.
+Native macOS/Bash 3.2 and additional Windows/Linux OS versions are unverified.
+
+A warm synthetic 10,000-file Windows cache-tree comparison returns identical
+counts/bytes: median 513 ms for the previous provider pipeline and 14 ms for
+the metadata enumerator (three repetitions). This isolates enumeration cost;
+it does not promise a fixed whole-audit speedup on other disks or machines.
+
+The existing `README.md` remains unchanged under its append-only rule.
