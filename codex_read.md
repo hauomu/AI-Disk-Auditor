@@ -24,5 +24,6 @@ instructions; user-facing direction and implementation details belong here.
 
 The fixture behavior checks live in `tests/test_ai_disk_audit.py`. They require
 Python only as a development-host test orchestrator and Git Bash on Windows;
-the auditor itself requires only Bash and standard utilities. Linux and macOS
-execution have not yet been verified in this Windows environment.
+the auditor itself requires only Bash and standard utilities. All seven behavior
+tests pass on native Linux (Artemis, GNU Bash 5.3.9). Windows Git Bash passes six
+tests and skips the newline-path test. Native macOS/Bash 3.2 remains unverified.
