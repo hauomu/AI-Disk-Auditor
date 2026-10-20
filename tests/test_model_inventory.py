@@ -98,6 +98,45 @@ class ModelInventory(unittest.TestCase):
         self.assertIn('Shards: 2/2 present; complete filename set',out)
         self.assertIn('Tensor dtypes: F16',out)
 
+    def test_package_data_vocab_and_proxy_modules_are_not_models_or_gateways(self):
+        for rel in ('Lib/site-packages/scipy/special/tests/data/boost.npz',
+                    'uv/cache/archive-v0/random/scipy/stats/_sobol_direction_numbers.npz',
+                    'Lib/site-packages/site-loader.pth','uv/cache/archive-v0/random/site-loader.pth',
+                    'uv/cache/archive-v0/random/torch/fx/proxy.py',
+                    'uv/cache/archive-v0/random/anthropic/types/gateway_timeout_error.py',
+                    '.venv_t5_550/urllib3/util/proxy.py','test/gateway_test.py',
+                    'scratch/proxy.py','notes/data.npz'):
+            p=self.store/rel;p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(b'fixture')
+        gguf(self.store/'runtime/models/ggml-vocab-gemma.gguf',{'general.name':'vocab fixture'})
+        gguf(self.store/'actual-model.gguf',{'general.name':'Real Model','general.file_type':15})
+        (self.store/'gateway.py').write_text('raise RuntimeError("never execute")')
+        out=self.run_audit()
+        model_section=out.split('=== Model files and sidecars ===',1)[1].split('=== Backend/runtime installations ===',1)[0]
+        self.assertIn('Real Model',model_section)
+        self.assertNotIn('ggml-vocab-',model_section)
+        for noise in ('boost.npz','_sobol_direction_numbers.npz','site-loader.pth','proxy.py','gateway_timeout_error.py','gateway_test.py','data.npz'):
+            self.assertNotIn(noise,out)
+        self.assertIn('=== Tokenizer/vocabulary assets ===',out)
+        self.assertIn('ggml-vocab-gemma.gguf',out)
+        self.assertIn('gateway.py',out)
+
+    def test_backend_files_are_grouped_by_installation(self):
+        for version in ('runtime-1','runtime-2'):
+            folder=self.store/'extensions/backends'/version;folder.mkdir(parents=True)
+            for name in ('ggml-cuda.dll','ggml-cpu.dll','ggml-base.dll','cublas64.dll'):(folder/name).write_bytes(b'x'*4096)
+        out=self.run_audit()
+        section=out.split('=== Backend/runtime installations ===',1)[1].split('=== Tokenizer/vocabulary assets ===',1)[0]
+        self.assertEqual(section.count('  Installation:'),2,out)
+        self.assertEqual(section.count('4 files;'),2,out)
+        self.assertIn('CUDA',section)
+        self.assertIn('GGML/CPU',section)
+
+    def test_explicit_gateway_root_keeps_custom_entrypoint(self):
+        folder=self.store/'custom-server';folder.mkdir();(folder/'proxy.py').write_text('raise RuntimeError("never execute")')
+        if os.name=='nt':extra='-GatewayRoot "'+str(folder)+'"'
+        else:extra='--gateway-root '+str(folder)
+        self.assertIn('proxy.py',self.run_audit(extra))
+
     @unittest.skipIf(os.name=='nt','Unix filename fallback')
     def test_no_python_filename_fallback(self):
         binpath=self.base/'bin';binpath.mkdir()

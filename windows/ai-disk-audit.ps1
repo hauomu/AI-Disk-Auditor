@@ -28,7 +28,7 @@ $seenText = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComp
 # Compile once per PowerShell session. Enumerate cached filesystem metadata in
 # .NET, avoiding a PowerShell provider object/pipeline operation per file.
 $native = $true
-if (-not ('AiDiskAuditInventoryV2.Scanner' -as [type])) {
+if (-not ('AiDiskAuditInventoryV3.Scanner' -as [type])) {
     try {
         Add-Type -TypeDefinition @'
 using System;
@@ -37,15 +37,15 @@ using System.Text;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
-namespace AiDiskAuditInventoryV2 {
+namespace AiDiskAuditInventoryV3 {
  public sealed class Result {
   public long Bytes, Files, Directories, Errors, SkippedLinks, OmittedAssets;
-  public List<AiDiskAuditIdentityV1.Candidate> Assets=new List<AiDiskAuditIdentityV1.Candidate>();
+  public List<AiDiskAuditIdentityV2.Candidate> Assets=new List<AiDiskAuditIdentityV2.Candidate>();
   public Dictionary<string,int> AssetCounts=new Dictionary<string,int>();
-  public void Capture(string path,long bytes) {
+  public void Capture(string path,long bytes,bool gateway) {
    if(path.StartsWith(@"\\?\UNC\"))path=@"\\"+path.Substring(8);
    else if(path.StartsWith(@"\\?\"))path=path.Substring(4);
-   var c=AiDiskAuditIdentityV1.Reader.CandidateFor(path,bytes);if(c==null)return;
+   var c=AiDiskAuditIdentityV2.Reader.CandidateFor(path,bytes,gateway);if(c==null)return;
    int n;AssetCounts.TryGetValue(c.Kind,out n);
    if(n>=10000){OmittedAssets++;return;}AssetCounts[c.Kind]=n+1;Assets.Add(c);
   }
@@ -70,7 +70,8 @@ namespace AiDiskAuditInventoryV2 {
    }
   }
   public static Result Measure(string path) { return Measure(path,false); }
-  public static Result Measure(string path,bool inventory) {
+  public static Result Measure(string path,bool inventory) { return Measure(path,inventory,false); }
+  public static Result Measure(string path,bool inventory,bool gateway) {
    var result=new Result();
    var stack=new Stack<DirectoryInfo>();
    string extended=path.StartsWith(@"\\?\") ? path :
@@ -83,15 +84,15 @@ namespace AiDiskAuditInventoryV2 {
       try {
        if((entry.Attributes & FileAttributes.ReparsePoint)!=0) {
         result.SkippedLinks++;
-        if(inventory && entry is FileInfo && AiDiskAuditIdentityV1.Reader.Safe(entry.FullName)) {
+        if(inventory && entry is FileInfo && AiDiskAuditIdentityV2.Reader.Safe(entry.FullName)) {
          string actual=Canonical(entry.FullName);
-         if(AiDiskAuditIdentityV1.Reader.Safe(actual))result.Capture(entry.FullName,new FileInfo(actual).Length);
+         if(AiDiskAuditIdentityV2.Reader.Safe(actual))result.Capture(entry.FullName,new FileInfo(actual).Length,gateway);
         }
         continue;
        }
        var child=entry as DirectoryInfo;
        if(child!=null) stack.Push(child);
-       else { long size=((FileInfo)entry).Length; result.Bytes+=size; result.Files++; if(inventory)result.Capture(entry.FullName,size); }
+       else { long size=((FileInfo)entry).Length; result.Bytes+=size; result.Files++; if(inventory)result.Capture(entry.FullName,size,gateway); }
       } catch(IOException) { result.Errors++; }
         catch(UnauthorizedAccessException) { result.Errors++; }
      }
@@ -103,24 +104,39 @@ namespace AiDiskAuditInventoryV2 {
   }
  }
 }
-namespace AiDiskAuditIdentityV1 {
+namespace AiDiskAuditIdentityV2 {
  public sealed class Candidate { public string Path,Kind; public long Bytes; }
  public sealed class Identity {
   public string Format="unknown",Role="model/weights candidate",Source="filename",Note="",HeaderJson="";
   public System.Collections.Generic.Dictionary<string,string> Meta=new System.Collections.Generic.Dictionary<string,string>();
  }
  public static class Reader {
+  public static string[] GatewayRoots=new string[0];
   const long MaxHeader=8*1024*1024, MaxMetadata=256*1024*1024;
-  static readonly System.Text.RegularExpressions.Regex ModelExt=new System.Text.RegularExpressions.Regex(@"\.(gguf|safetensors|onnx|pt|pth|ckpt|tflite|npz|mlmodel)$",System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+  static readonly System.Text.RegularExpressions.Regex ModelExt=new System.Text.RegularExpressions.Regex(@"\.(gguf|safetensors|onnx|pt|pth|ckpt|tflite|mlmodel)$",System.Text.RegularExpressions.RegexOptions.IgnoreCase);
   static readonly System.Text.RegularExpressions.Regex Backend=new System.Text.RegularExpressions.Regex(@"(ggml|cuda|cudnn|cublas|amdhip|hipblas|hiprtc|rocblas|vulkan|directml|mlx|metal).*\.(so(?:\..*)?|dll|dylib|metallib|metal)$",System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-  static readonly System.Text.RegularExpressions.Regex Gateway=new System.Text.RegularExpressions.Regex(@"(gateway|proxy|litellm|frontdoor|openai[-_]server).*\.(py|js|sh|ps1|exe)$",System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+  static readonly System.Text.RegularExpressions.Regex Gateway=new System.Text.RegularExpressions.Regex(@"(^|[-_])(gateway|litellm|frontdoor|openai[-_]server).*\.(py|js|sh|ps1|exe)$",System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+  public static bool Noise(string path) {
+   string n="/"+path.Replace('\\','/').ToLowerInvariant()+"/";
+   foreach(string component in new[]{"/.git/","/tests/","/test/","/examples/","/sample_data/","/test_data/"})if(n.Contains(component))return true;
+   return !Safe(path);
+  }
+  static bool Dependency(string path) {
+   return System.Text.RegularExpressions.Regex.IsMatch(path,@"/(site-packages|node_modules|archive-v[0-9]+|wheels-v[0-9]+|_vendor|venv|\.venv[^/]*)/");
+  }
   public static Candidate CandidateFor(string path,long size) {
+   return CandidateFor(path,size,false);
+  }
+  public static Candidate CandidateFor(string path,long size,bool gateway) {
    string name=System.IO.Path.GetFileName(path).ToLowerInvariant();
    string normal=path.Replace('\\','/').ToLowerInvariant(); string kind=null;
-   if(ModelExt.IsMatch(name) || ((name.Contains("mmproj")||name.Contains("projector")||name.Contains("ngram")||name.Contains("n-gram")||name.Contains("-mtp")) && name.EndsWith(".bin")) || ((name.StartsWith("pytorch_model")||name.StartsWith("adapter_model"))&&name.EndsWith(".bin")))kind="Model";
+   foreach(string root in GatewayRoots)if(normal.StartsWith(root.Replace('\\','/').TrimEnd('/')+"/",System.StringComparison.OrdinalIgnoreCase)){gateway=true;break;}
+   if(Noise(path))return null;
+   if(name.StartsWith("ggml-vocab-")&&name.EndsWith(".gguf"))kind="Auxiliary";
+   else if((ModelExt.IsMatch(name)&&!(name.EndsWith(".pth")&&Dependency(normal))) || (name.EndsWith(".npz")&&!Dependency(normal)&&System.Text.RegularExpressions.Regex.IsMatch(name,@"^(model|weights|adapter|checkpoint)([-_.]|$)")) || ((name.Contains("mmproj")||name.Contains("projector")||name.Contains("ngram")||name.Contains("n-gram")||name.Contains("-mtp")) && (name.EndsWith(".bin")||name.EndsWith(".table"))) || ((name.StartsWith("pytorch_model")||name.StartsWith("adapter_model"))&&name.EndsWith(".bin")))kind="Model";
    else if(normal.Contains("/blobs/") && System.Text.RegularExpressions.Regex.IsMatch(name,@"^(sha256-)?[a-f0-9]{40,64}$"))kind="Model";
    else if(Backend.IsMatch(name)||name=="llama-server.exe"||name=="ollama.exe")kind="Backend";
-   else if(Gateway.IsMatch(name)&&!normal.Contains("/tests/")&&!normal.Contains("/examples/")&&!normal.Contains("/site-packages/")&&!normal.Contains("/node_modules/"))kind="Gateway";
+   else if((Gateway.IsMatch(name)||(gateway&&System.Text.RegularExpressions.Regex.IsMatch(name,@"\.(py|js|sh|ps1|exe)$")))&&!Dependency(normal))kind="Gateway";
    else if(normal.Contains("/manifests/") && size<=1024*1024 && !name.EndsWith(".env") && !name.Contains("secret") && !name.Contains("token"))kind="Manifest";
    return kind==null?null:new Candidate{Path=path,Kind=kind,Bytes=size};
   }
@@ -173,7 +189,7 @@ namespace AiDiskAuditIdentityV1 {
    else if(name.Contains("mmproj")||name.Contains("projector"))item.Role="multimodal projector candidate";
    else if(System.Text.RegularExpressions.Regex.IsMatch(name,@"(^|[-_.])mtp([-_.]|$)"))item.Role="MTP sidecar candidate";
    try {
-    if(!Safe(path)||!Safe(AiDiskAuditInventoryV2.Scanner.Canonical(path)))throw new System.IO.InvalidDataException("sensitive target excluded");
+    if(!Safe(path)||!Safe(AiDiskAuditInventoryV3.Scanner.Canonical(path)))throw new System.IO.InvalidDataException("sensitive target excluded");
     using(var f=new System.IO.FileStream(path,System.IO.FileMode.Open,System.IO.FileAccess.Read,System.IO.FileShare.ReadWrite|System.IO.FileShare.Delete))
     using(var r=new System.IO.BinaryReader(f)){
      string magic=System.Text.Encoding.ASCII.GetString(r.ReadBytes(4));
@@ -249,8 +265,11 @@ function Measure-Provider([string]$Path) {
             if ($item.PSIsContainer) { $stack.Push($item.FullName) }
             else {
                 $result.Bytes += $item.Length; $result.Files++
-                if(-not $NoInventory -and $item.Name -match '(?i)\.(gguf|safetensors|onnx|pt|pth|ckpt)$|(?:mmproj|mtp|ngram).*\.bin$') {
-                    if($result.Assets.Count -lt 10000){$result.Assets.Add([pscustomobject]@{Path=$item.FullName;Kind='Model';Bytes=$item.Length})}else{$result.OmittedAssets++}
+                $noise=$item.FullName.Replace('\','/') -match '(?i)/(.git|tests|test|examples|sample_data|test_data|secrets|credentials)/'
+                $packagePth=$item.Extension -eq '.pth' -and $item.FullName.Replace('\','/') -match '(?i)/(site-packages|archive-v[0-9]+|\.venv[^/]*)/'
+                if(-not $NoInventory -and -not $noise -and -not $packagePth -and $item.Name -match '(?i)\.(gguf|safetensors|onnx|pt|pth|ckpt)$|(?:mmproj|mtp|ngram).*\.bin$') {
+                    $kind=if($item.Name -like 'ggml-vocab-*.gguf'){'Auxiliary'}else{'Model'}
+                    if($result.Assets.Count -lt 10000){$result.Assets.Add([pscustomobject]@{Path=$item.FullName;Kind=$kind;Bytes=$item.Length})}else{$result.OmittedAssets++}
                 }
             }
         }
@@ -261,7 +280,7 @@ function Measure-Provider([string]$Path) {
 
 function Read-ModelJson([string]$Path) {
     try {
-        if (-not [AiDiskAuditIdentityV1.Reader]::Safe($Path) -or -not [AiDiskAuditIdentityV1.Reader]::Safe([AiDiskAuditInventoryV2.Scanner]::Canonical($Path))) { return $null }
+        if (-not [AiDiskAuditIdentityV2.Reader]::Safe($Path) -or -not [AiDiskAuditIdentityV2.Reader]::Safe([AiDiskAuditInventoryV3.Scanner]::Canonical($Path))) { return $null }
         $stream=[IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite)
         try {
             if ($stream.Length -gt 1MB) { return $null }
@@ -275,6 +294,28 @@ function Safe-IdentityText($Value) {
     $text=[regex]::Replace([string]$Value,'[\x00-\x1f\x7f]','?')
     if ($text.Length -gt 240) { return $text.Substring(0,240) }
     return $text
+}
+function Add-GroupedAssets($Lines,$Assets,[string]$Kind) {
+    $title=if($Kind -eq 'Backend'){'Backend/runtime installations'}else{'Tokenizer/vocabulary assets'}
+    $Lines.Add('');$Lines.Add('=== '+$title+' ===')
+    $groups=@($Assets | Where-Object {$_.Kind -eq $Kind} | Group-Object {
+        $normal=$_.Path.Replace('\','/')
+        $match=[regex]::Match($normal,'(?i)^(.*/extensions/backends/[^/]+)(?:/|$)')
+        if($match.Success){$match.Groups[1].Value.Replace('/','\')}else{[IO.Path]::GetDirectoryName($_.Path)}
+    } | Sort-Object @{Expression={($_.Group | Measure-Object Bytes -Sum).Sum};Descending=$true})
+    foreach($group in @($groups | Select-Object -First 100)) {
+        $size=([double]($group.Group | Measure-Object Bytes -Sum).Sum/1GB).ToString('F3',[Globalization.CultureInfo]::InvariantCulture)
+        $types=if($Kind -eq 'Backend'){@($group.Group | ForEach-Object {
+            $name=[IO.Path]::GetFileName($_.Path)
+            if($name -match 'hip|rocblas|rocm'){'ROCm/HIP'}elseif($name -match 'cuda|cudnn|cublas'){'CUDA'}elseif($name -match 'vulkan'){'Vulkan'}elseif($name -match 'metal|mlx'){'Metal/MLX'}elseif($name -match 'directml'){'DirectML'}else{'GGML/CPU/inference runtime'}
+        } | Sort-Object -Unique) -join ', '}else{'tokenizer/vocabulary assets'}
+        $Lines.Add('  Installation: '+(Safe-IdentityText $group.Name))
+        $Lines.Add("  $types [filename/path]; $($group.Count) files; $size GiB")
+        $examples=@($group.Group | Sort-Object Bytes -Descending | Select-Object -First 3 | ForEach-Object {Safe-IdentityText ([IO.Path]::GetFileName($_.Path))})
+        $Lines.Add('  Examples: '+($examples -join ', '))
+    }
+    if(-not $groups.Count){$Lines.Add('  No matching files in selected locations; not proof of absence.')}
+    if($groups.Count -gt 100){$Lines.Add("  Installation rows limited to 100 of $($groups.Count).")}
 }
 function Add-AssetInventory($Lines,$Assets,[int]$Limit,[bool]$NativeAvailable) {
     $Lines.Add(''); $Lines.Add('=== Model files and sidecars ===')
@@ -295,6 +336,7 @@ function Add-AssetInventory($Lines,$Assets,[int]$Limit,[bool]$NativeAvailable) {
             $Lines.Add('  Total apparent size: '+($entry.Bytes/1GB).ToString('F3',[Globalization.CultureInfo]::InvariantCulture)+' GiB')
             $Lines.Add('  Role/quant/publisher: unknown; native metadata reader unavailable.')
         }
+        Add-GroupedAssets $Lines $Assets 'Auxiliary'
         return
     }
     $references=New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase)
@@ -309,15 +351,15 @@ function Add-AssetInventory($Lines,$Assets,[int]$Limit,[bool]$NativeAvailable) {
             if([string]$layer.mediaType -notmatch 'image\.(model|projector|adapter|tensor)'){continue}
             if([string]$layer.digest -notmatch '^sha256:[a-f0-9]{64}$'){continue}
             $path=[IO.Path]::Combine($blobs,(([string]$layer.digest).Replace(':','-')))
-            try{$physical=[AiDiskAuditInventoryV2.Scanner]::Canonical($path)}catch{continue}
+            try{$physical=[AiDiskAuditInventoryV3.Scanner]::Canonical($path)}catch{continue}
             $reference='Ollama manifest: '+$normal.Substring($offset+11)
             if($references.ContainsKey($physical)){$references[$physical]+='; '+$reference}else{$references.Add($physical,$reference)}
         }
     }
     $models=New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
     foreach($entry in @($Assets | Where-Object {$_.Kind -eq 'Model'} | Sort-Object Bytes -Descending)) {
-        try{$physical=[AiDiskAuditInventoryV2.Scanner]::Canonical($entry.Path)}catch{continue}
-        if(-not [AiDiskAuditIdentityV1.Reader]::Safe($physical)){continue}
+        try{$physical=[AiDiskAuditInventoryV3.Scanner]::Canonical($entry.Path)}catch{continue}
+        if(-not [AiDiskAuditIdentityV2.Reader]::Safe($physical)){continue}
         if(-not $models.ContainsKey($physical)){$models.Add($physical,$entry)}
         elseif([IO.Path]::GetExtension($models[$physical].Path) -eq '' -and [IO.Path]::GetExtension($entry.Path) -ne ''){$models[$physical]=$entry}
     }
@@ -338,17 +380,17 @@ function Add-AssetInventory($Lines,$Assets,[int]$Limit,[bool]$NativeAvailable) {
     }
     $configCache=@{}; $shardCache=@{}; $shown=0
     foreach($entry in @($sets.Values | Sort-Object Bytes -Descending | Select-Object -First $Limit)) {
-        $path=$entry.Path;$identity=[AiDiskAuditIdentityV1.Reader]::Inspect($path)
+        $path=$entry.Path;$identity=[AiDiskAuditIdentityV2.Reader]::Inspect($path)
         $first=[regex]::Replace($path,'-\d{5}-of-(\d{5})\.gguf$','-00001-of-$1.gguf')
         if($first -ne $path -and [IO.File]::Exists($first) -and -not $identity.Meta.ContainsKey('general.file_type')) {
-            if(-not $shardCache.ContainsKey($first)){$shardCache[$first]=[AiDiskAuditIdentityV1.Reader]::Inspect($first)}
+            if(-not $shardCache.ContainsKey($first)){$shardCache[$first]=[AiDiskAuditIdentityV2.Reader]::Inspect($first)}
             foreach($key in $shardCache[$first].Meta.Keys){if(-not $identity.Meta.ContainsKey($key)){$identity.Meta[$key]=$shardCache[$first].Meta[$key]}}
             $identity.Note+='; missing identity fields inherited from first-shard GGUF header; tensors not validated'
         }
         $meta=$identity.Meta;$quant='unknown';$publisher='unknown';$repo='unknown';$dtype='';$arch='unknown';$modelName=[IO.Path]::GetFileName($path)
         if($meta.ContainsKey('general.name')){$modelName=Safe-IdentityText $meta['general.name']}
         if($meta.ContainsKey('general.architecture')){$arch=Safe-IdentityText $meta['general.architecture']}
-        if($meta.ContainsKey('general.file_type')){$quant=[AiDiskAuditIdentityV1.Reader]::FileType($meta['general.file_type'])+' [GGUF]'}
+        if($meta.ContainsKey('general.file_type')){$quant=[AiDiskAuditIdentityV2.Reader]::FileType($meta['general.file_type'])+' [GGUF]'}
         if($meta.ContainsKey('general.organization')){$publisher=(Safe-IdentityText $meta['general.organization'])+' [GGUF declared]'}
         elseif($meta.ContainsKey('general.author')){$publisher=(Safe-IdentityText $meta['general.author'])+' [GGUF declared]'}
         if($identity.HeaderJson){
@@ -399,14 +441,8 @@ function Add-AssetInventory($Lines,$Assets,[int]$Limit,[bool]$NativeAvailable) {
     if(-not $shown){$Lines.Add('  No recognized model files in selected locations. Add -Root for another store.')}
     if($sets.Count -gt $Limit){$Lines.Add("  Model rows limited to $Limit of $($sets.Count) models/sets; increase -ModelLimit.")}
     $Lines.Add('Model-set sizes sum discovered shards. Filename completeness does not validate tensor contents.')
-    $Lines.Add('');$Lines.Add('=== Backend/runtime files ===')
-    $backendEntries=@($Assets | Where-Object {$_.Kind -eq 'Backend'} | Sort-Object Bytes -Descending)
-    foreach($entry in @($backendEntries | Select-Object -First 100)) {
-        $name=[IO.Path]::GetFileName($entry.Path)
-        $backend=if($name -match 'hip|rocblas|rocm'){'ROCm/HIP'}elseif($name -match 'cuda|cudnn|cublas'){'CUDA'}elseif($name -match 'vulkan'){'Vulkan'}elseif($name -match 'metal|mlx'){'Metal/MLX'}elseif($name -match 'directml'){'DirectML'}else{'GGML/CPU/inference runtime'}
-        $Lines.Add("  $backend [filename/path]: "+(Safe-IdentityText $entry.Path))
-    }
-    if(-not $backendEntries.Count){$Lines.Add('  No matching backend files in the selected locations; not proof of absence.')}
+    Add-GroupedAssets $Lines $Assets 'Backend'
+    Add-GroupedAssets $Lines $Assets 'Auxiliary'
     $Lines.Add('');$Lines.Add('=== Gateway/API frontend files ===')
     $gateways=@($Assets | Where-Object {$_.Kind -eq 'Gateway'} | Sort-Object Bytes -Descending)
     foreach($entry in @($gateways|Select-Object -First 100)){$Lines.Add('  Gateway/frontend candidate [filename/path]: '+(Safe-IdentityText $entry.Path))}
@@ -485,7 +521,7 @@ if ($Comprehensive) {
 $physical = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
 foreach ($target in $targets) {
     try {
-        if ($native) { $path=[AiDiskAuditInventoryV2.Scanner]::Canonical($target.Path) }
+        if ($native) { $path=[AiDiskAuditInventoryV3.Scanner]::Canonical($target.Path) }
         else {
             $item=Get-Item -LiteralPath $target.Path -Force
             if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Cannot resolve link in fallback mode' }
@@ -495,6 +531,9 @@ foreach ($target in $targets) {
     } catch { $issues.Add("Cannot resolve directory: $($target.Path)") }
 }
 $selected = New-Object 'System.Collections.Generic.List[object]'
+if($native){
+    [AiDiskAuditIdentityV2.Reader]::GatewayRoots=@($targets | Where-Object {$_.Category -eq 'Gateway'} | ForEach-Object {try{[AiDiskAuditInventoryV3.Scanner]::Canonical($_.Path)}catch{}})
+}
 $parents = New-Object 'System.Collections.Generic.List[string]'
 $covered=0
 foreach ($target in @($physical.Values | Sort-Object @{Expression={$_.Path.Length}},Path)) {
@@ -516,7 +555,7 @@ $omittedAssets=[long]0
 $fileCount=[long]0; $dirCount=[long]0; $skipped=[long]0
 foreach ($target in $selected) {
     if ($ListRoots) { $lines.Add("ROOT`t$($target.Category)`t$($target.Path)"); continue }
-    if ($native) { $measurement=[AiDiskAuditInventoryV2.Scanner]::Measure($target.Path,(-not $NoInventory)) }
+    if ($native) { $measurement=[AiDiskAuditInventoryV3.Scanner]::Measure($target.Path,(-not $NoInventory),($target.Category -eq 'Gateway')) }
     else { $measurement=Measure-Provider $target.Path }
     if (-not $NoInventory) {
         foreach($asset in $measurement.Assets){$assets.Add($asset)}
@@ -542,7 +581,7 @@ if (-not $ListRoots -and -not $NoInventory) {
     if (-not $HomeOnly -and $native) {
         foreach($name in 'vulkan-1.dll','nvcuda.dll','DirectML.dll') {
             $path=Join-Base $env:SystemRoot ('System32\'+$name)
-            if([IO.File]::Exists($path)){$assets.Add([AiDiskAuditIdentityV1.Reader]::CandidateFor($path,([IO.FileInfo]$path).Length))}
+            if([IO.File]::Exists($path)){$assets.Add([AiDiskAuditIdentityV2.Reader]::CandidateFor($path,([IO.FileInfo]$path).Length))}
         }
     }
     Add-AssetInventory $lines $assets $ModelLimit $native

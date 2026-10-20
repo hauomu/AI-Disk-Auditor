@@ -168,3 +168,34 @@ Validation: native Linux 22 passed plus one Windows-only skip; Windows model sui
 five passed plus one Unix-only skip. Added checks cover group size/ranking before
 limits, missing parts, separate directories, safetensors sets, separate projectors
 and both dependency-restricted fallbacks. Existing script-block workflow remains.
+
+## Remove package-data and gateway false positives
+
+The user's Windows report revealed SciPy/Matplotlib NPZ data files and Python
+`.pth` loaders mislabeled as weights, vocabulary GGUFs mislabeled as models, and
+cached dependency proxy modules mislabeled as gateways. Inventory classification
+now excludes test/example/sample trees, requires a model-like basename for NPZ
+candidates outside dependency stores, excludes Python package `.pth` loaders, and
+classifies `ggml-vocab-*.gguf` separately as tokenizer/vocabulary assets.
+
+Generic proxy filenames do not imply an AI gateway. Gateway candidate names must
+identify a gateway/frontdoor/LiteLLM/OpenAI server, or reside in a known/explicit
+gateway root; dependency caches and environment packages do not qualify. Explicit
+gateway hints survive parent-root deduplication. Directory sizing is unchanged;
+these exclusions apply to file identity, not storage accounting.
+
+Runtime libraries and vocabulary assets are summarized by containing installation
+directory (LM Studio backend/version directories are recognized), with count,
+combined apparent size, detected backend families and at most three example names.
+Different runtime installations/versions remain visible. These are path-derived
+installation candidates, not proof of active backend use. Known vocabulary naming
+is separated without claiming universal tokenizer detection. The Windows scanner
+types are versioned so repeated script-block runs cannot reuse an older classifier.
+
+Validation: Linux 25 passed plus one Windows-only skip; Windows model/classification
+suite eight passed plus one Unix-only skip, and six traversal fixtures passed.
+A path-only replay of the user's 680 reported entries excludes 556 false-positive
+candidates, retains five model candidates, separates 19 vocabulary assets and
+retains 100 reported backend files for grouped presentation. This replay opens no
+AppData/model files and does not claim those five candidates have verified contents.
+Sharded-model grouping remains covered. Changes are in the same pending PR #5.
