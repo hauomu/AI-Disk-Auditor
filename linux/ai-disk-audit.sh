@@ -299,6 +299,8 @@ inventory() {
   [ "$NO_INVENTORY" = true ] && return
   local i group path name role count=0
   local args=()
+  local shard_patterns=() shard_counts=() shard_expected=() shard_indices=()
+  local pattern index expected slot j missing present
   for ((i=0; i<${#SELECTED_PATHS[@]}; i++)); do
     group=${SELECTED_GROUPS[$i]}
     if [ "$group" = Caches ]; then
@@ -308,6 +310,11 @@ inventory() {
     args[${#args[@]}]=$group; args[${#args[@]}]=${SELECTED_PATHS[$i]}
   done
   if command -v python3 >/dev/null 2>&1; then
+    for ((i=0; i<${#PATHS[@]}; i++)); do
+      if [ "${GROUPS_LIST[$i]}" = Gateways ] && [ -d "${PATHS[$i]}" ]; then
+        args[${#args[@]}]=GatewayHint; args[${#args[@]}]=${PATHS[$i]}
+      fi
+    done
     python3 - "$MODEL_LIMIT" "$HOME_ONLY" "${args[@]}" <<'AI_AUDIT_METADATA_PY'
 """Embedded, optional Linux metadata enrichment. No dependencies or tensor reads."""
 import collections, glob, json, os, re, struct, sys
@@ -315,6 +322,7 @@ from pathlib import Path
 
 LIMIT=int(sys.argv[1]); HOME_ONLY=sys.argv[2]=='true'
 ROOTS=list(zip(sys.argv[3::2],sys.argv[4::2]))
+GATEWAY_PATHS=[str(Path(p).resolve()) for g,p in ROOTS if g in {'Gateways','GatewayHint'}]
 MAX_HEADER=8*1024*1024
 MAX_METADATA=256*1024*1024
 FT={0:'F32',1:'F16',2:'Q4_0',3:'Q4_1',7:'Q8_0',8:'Q5_0',9:'Q5_1',10:'Q2_K',11:'Q3_K_S',12:'Q3_K_M',13:'Q3_K_L',14:'Q4_K_S',15:'Q4_K_M',16:'Q5_K_S',17:'Q5_K_M',18:'Q6_K',19:'IQ2_XXS',20:'IQ2_XS',21:'Q2_K_S',22:'IQ3_XS',23:'IQ3_XXS',24:'IQ1_S',25:'IQ4_NL',26:'IQ3_S',27:'IQ3_M',28:'IQ2_S',29:'IQ2_M',30:'IQ4_XS',31:'IQ1_M',32:'BF16',36:'TQ1_0',37:'TQ2_0',38:'MXFP4_MOE',39:'NVFP4',40:'Q1_0',41:'Q2_0'}
@@ -381,26 +389,32 @@ def gguf(path):
             return meta,''
         except (ValueError,OSError,struct.error) as e:return meta,str(e)
 
-def classify(path):
+def classify(path,gateway=False):
     name=path.name.lower(); lower=str(path).replace('\\','/').lower(); ext=path.suffix.lower()
+    gateway=gateway or any(str(path).startswith(p.rstrip('/')+'/') for p in GATEWAY_PATHS)
+    if not safe(path) or any(p.lower() in {'.git','tests','test','examples','sample_data','test_data'} for p in path.parts):return None
+    dependency=bool(re.search(r'/(site-packages|node_modules|archive-v\d+|wheels-v\d+|_vendor|venv|\.venv[^/]*)/',lower))
+    if name.startswith('ggml-vocab-') and ext=='.gguf':
+        return {'role':'tokenizer/vocabulary assets','format':'GGUF','source':'filename','model':False,'category':'Auxiliary'}
     role=''; fmt=''; source='filename'; model=True
     if ('ngram' in name or 'n-gram' in name) and ext in {'.bin','.gguf','.table'}:role='n-gram table candidate';fmt=ext.lstrip('.').upper() or 'unknown'
     elif ('mmproj' in name or 'projector' in name) and ext in {'.gguf','.bin','.safetensors'}:role='multimodal projector candidate';fmt=ext.lstrip('.').upper()
     elif re.search(r'(^|[-_.])mtp([-_.]|$)',name) and ext in {'.gguf','.bin','.safetensors'}:role='MTP sidecar candidate';fmt=ext.lstrip('.').upper()
-    elif ext in {'.gguf','.safetensors','.onnx','.pt','.pth','.ckpt','.tflite','.npz','.mlmodel'}:role='model/weights';fmt=ext.lstrip('.').upper()
+    elif ext in {'.gguf','.safetensors','.onnx','.pt','.pth','.ckpt','.tflite','.mlmodel'} and not (ext=='.pth' and dependency):role='model/weights';fmt=ext.lstrip('.').upper()
+    elif ext=='.npz' and not dependency and re.match(r'^(model|weights|adapter|checkpoint)([-_.]|$)',name):role='model/weights candidate';fmt='NPZ'
     elif name.startswith(('pytorch_model','adapter_model')) and ext=='.bin':role='adapter weights' if 'adapter' in name else 'model weights';fmt='BIN'
     elif '/blobs/' in lower and re.fullmatch(r'(?:sha256-)?[a-f0-9]{40,64}',name):role='cached model blob candidate';fmt='unknown'
     elif re.search(r'(ggml|cuda|cudnn|cublas|amdhip|hipblas|hiprtc|rocblas|vulkan|directml|mlx|metal)',name) and (re.search(r'\.(so(?:\..*)?|dll|dylib|metallib|metal)$',name)):
         backend='ROCm/HIP' if re.search('hip|rocblas|rocm',name) else 'CUDA' if re.search('cuda|cudnn|cublas',name) else 'Vulkan' if 'vulkan' in name else 'Metal/MLX' if re.search('metal|mlx',name) else 'DirectML' if 'directml' in name else 'GGML/CPU'
         return {'role':backend+' backend library','format':ext.lstrip('.').upper(),'source':'filename/path','model':False,'category':'Backends'}
-    elif (re.search(r'gateway|proxy|litellm|frontdoor|openai[-_]server',name) and ext in {'.py','.js','.sh','.ps1','.exe',''}) and not any(p in lower for p in ['/site-packages/','/node_modules/']):
+    elif (gateway or re.search(r'(^|[-_])(gateway|litellm|frontdoor|openai[-_]server)',name)) and ext in {'.py','.js','.sh','.ps1','.exe',''} and not dependency:
         return {'role':'gateway/API frontend candidate','format':ext.lstrip('.').upper() or 'executable/script','source':'filename/path','model':False,'category':'Gateways'}
     elif name in {'llama-server','llama-server.exe','ollama','ollama.exe','local-ai','local-ai.exe'}:
         return {'role':'inference server executable','format':'executable','source':'filename/path','model':False,'category':'Backends'}
     if not role:return None
     return {'role':role,'format':fmt,'source':source,'model':model,'category':'Models'}
 
-def add(path,reference=''):
+def add(path,reference='',gateway=False):
     try:
         p=Path(path); actual=p.resolve()
         if not safe(actual) or not p.is_file():return
@@ -410,7 +424,7 @@ def add(path,reference=''):
             if Path(records[key]['path']).suffix=='' and p.suffix:
                 records[key]['path']=str(p)
             return
-        info=classify(p)
+        info=classify(p,gateway)
         if not info:return
         info.update(path=str(p),actual=key,size=p.stat().st_size,refs={reference} if reference else set())
         records[key]=info
@@ -445,6 +459,7 @@ def manifests(base):
 
 visited=set(); entries=0
 for group,raw in ROOTS:
+    if group=='GatewayHint':continue
     if entries>300000:break
     root=Path(raw)
     # Package/compile caches are measured by the size scan, not walked again.
@@ -468,7 +483,7 @@ for group,raw in ROOTS:
             entries+=1
             if entries>300000:issues.append('Inventory entry budget reached; use a narrower --root');break
             path=Path(parent)/name
-            if classify(path):add(path)
+            if classify(path,group=='Gateways'):add(path,gateway=group=='Gateways')
         if entries>300000:break
 
 if not HOME_ONLY:
@@ -527,11 +542,35 @@ def enrich(item):
     item.update(quant=quant,publisher=publisher,repo=repo,dtype=dtype,note=note,arch=clean(meta.get('general.architecture',configs.get(str(path.parent/'config.json'),{}).get('model_type','unknown'))),mtp={k:v for k,v in meta.items() if k.endswith('.nextn_predict_layers')})
 
 print('\n=== Model files and sidecars ===')
-models=sorted((i for i in records.values() if i['model']),key=lambda i:i['size'],reverse=True)
+sets={}
+for item in (i for i in records.values() if i['model']):
+    path=Path(item['path'])
+    match=re.fullmatch(r'(.+)-(\d{5})-of-(\d{5})(\.(?:gguf|safetensors|bin))',path.name,re.I)
+    index=int(match[2]) if match else 0; expected=int(match[3]) if match else 0
+    if not (match and 1<=index<=expected):
+        sets[('file',item['actual'])]={'item':dict(item),'members':[item]}
+        continue
+    key=('set',str(path.parent),match[1],match[3],match[4])
+    if key not in sets:sets[key]={'item':dict(item),'members':[],'indices':set(),'expected':expected,'pattern':str(path.parent/(match[1]+'-*-of-'+match[3]+match[4])),'first':index}
+    group=sets[key];group['members'].append(item);group['indices'].add(index)
+    if index<group['first']:group['item']=dict(item);group['first']=index
+models=[]
+for group in sets.values():
+    item=group['item'];item['size']=sum(i['size'] for i in group['members'])
+    item['refs']=set().union(*(i['refs'] for i in group['members']))
+    item['shards']=group if 'expected' in group else None
+    models.append(item)
+models.sort(key=lambda i:i['size'],reverse=True)
 for item in models[:LIMIT]:
     enrich(item)
     if item['role']=='cached model blob candidate' and not item['refs'] and item['format']=='unknown':continue
-    print('\n  File: '+json.dumps(item['path'],ensure_ascii=False))
+    group=item['shards']
+    if group:
+        missing=[n for n in range(1,group['expected']+1) if n not in group['indices']]
+        print('\n  Model set: '+json.dumps(group['pattern'],ensure_ascii=False))
+        print('  Shards: %s/%s present; %s'%(len(group['indices']),group['expected'],'missing: '+','.join('%05d'%n for n in missing[:20])+(' ...' if len(missing)>20 else '') if missing else 'complete filename set'))
+        print('  Header file: '+json.dumps(item['path'],ensure_ascii=False))
+    else:print('\n  File: '+json.dumps(item['path'],ensure_ascii=False))
     print('  Role: '+item['role']+'; format: '+item['format']+'; size: %.3f GiB'%(item['size']/2**30))
     print('  Model: '+item.get('name',Path(item['path']).name)+'; architecture: '+item['arch'])
     print('  Quant: '+item['quant']+('; filename hint: '+item['hint']+' [inferred]' if item['hint'] else ''))
@@ -543,16 +582,32 @@ for item in models[:LIMIT]:
     if item['note']:print('  Metadata note: '+clean(item['note']))
 if not models:print('  No recognized model files in the selected locations. Add --root for another store.')
 if len(models)>LIMIT:print('  Model rows limited to %s of %s candidates; increase --model-limit.'%(LIMIT,len(models)))
-for category in ['Backends','Gateways']:
+for category in ['Backends','Auxiliary','Gateways']:
     items=sorted((i for i in records.values() if i['category']==category),key=lambda i:i['size'],reverse=True)
-    print('\n=== '+('Backend/runtime files' if category=='Backends' else 'Gateway/API frontend files')+' ===')
-    for item in items[:100]:print('  '+item['role']+' ['+item['source']+']: '+json.dumps(item['path'],ensure_ascii=False))
+    print('\n=== '+({'Backends':'Backend/runtime installations','Auxiliary':'Tokenizer/vocabulary assets','Gateways':'Gateway/API frontend files'}[category])+' ===')
+    if category in {'Backends','Auxiliary'}:
+        installations={}
+        for item in items:
+            directory=str(Path(item['path']).parent)
+            match=re.match(r'(.*/extensions/backends/[^/]+)(?:/|$)',str(item['path']))
+            if match:directory=match[1]
+            group=installations.setdefault(directory,{'size':0,'count':0,'roles':set(),'examples':[]})
+            group['size']+=item['size'];group['count']+=1;group['roles'].add(item['role'])
+            if len(group['examples'])<3:group['examples'].append(Path(item['path']).name)
+        for directory,group in sorted(installations.items(),key=lambda p:p[1]['size'],reverse=True)[:100]:
+            print('  Installation: '+json.dumps(directory,ensure_ascii=False))
+            print('  '+', '.join(sorted(group['roles']))+' [filename/path]; %s files; %.3f GiB'%(group['count'],group['size']/2**30))
+            print('  Examples: '+', '.join(clean(n) for n in group['examples']))
+        if len(installations)>100:print('  Installation rows limited to 100 of %s.'%len(installations))
+    else:
+        for item in items[:100]:print('  '+item['role']+' ['+item['source']+']: '+json.dumps(item['path'],ensure_ascii=False))
     if not items:print('  No matching files in the selected locations; this does not prove the software is absent.')
-    if len(items)>100:print('  Showing 100 of %s matching files.'%len(items))
+    if category=='Gateways' and len(items)>100:print('  Showing 100 of %s matching files.'%len(items))
 for issue in issues[:20]:print('  INVENTORY ISSUE: '+clean(issue))
 print('\nIdentity comes from bounded headers/manifests where available; filename/path roles are candidates.')
 print('Repository/uploader, model author and quantizer are distinct. Unknown fields remain unknown.')
 print('Per-file sizes are apparent lengths, which can exceed allocated disk use for sparse files.')
+print('Model-set sizes sum discovered shards. Filename completeness does not validate tensor contents.')
 print('No tensors are loaded, models hashed, services started, or gateway secrets read.')
 AI_AUDIT_METADATA_PY
     [ "$?" -eq 0 ] && return
@@ -563,22 +618,55 @@ AI_AUDIT_METADATA_PY
   while IFS= read -r -d '' path; do
     name=${path##*/}; role=
     case "$name" in
+      ggml-vocab-*.gguf) role='tokenizer/vocabulary asset [filename]' ;;
       *ngram*.bin|*ngram*.table|*n-gram*.bin) role='n-gram table candidate' ;;
       *mmproj*.gguf|*projector*.gguf) role='multimodal projector candidate' ;;
       *mtp*.gguf|*mtp*.bin) role='MTP sidecar candidate' ;;
       *.gguf|*.safetensors|*.onnx|*.pth|*.pt|*.ckpt|pytorch_model*.bin|adapter_model*.bin) role='model/weights candidate' ;;
       *cuda*.so*|*cublas*.so*|*hip*.so*|*rocblas*.so*|*vulkan*.so*|*ggml*.so*|*metal*.dylib|*.metallib) role='backend library candidate' ;;
-      *gateway*.py|*proxy*.py|*frontdoor*.py|*litellm*.py) role='gateway/frontend candidate' ;;
+      *gateway*.py|*frontdoor*.py|*litellm*.py) role='gateway/frontend candidate' ;;
     esac
     [ -n "$role" ] || continue
+    if [[ "$name" =~ ^(.+)-([0-9]{5})-of-([0-9]{5})(\.(gguf|safetensors|bin))$ ]]; then
+      index=$((10#${BASH_REMATCH[2]})); expected=$((10#${BASH_REMATCH[3]}))
+      pattern="${path%/*}/${BASH_REMATCH[1]}-*-of-${BASH_REMATCH[3]}${BASH_REMATCH[4]}"
+      if [ "$index" -ge 1 ] && [ "$index" -le "$expected" ]; then
+        slot=-1
+        for ((j=0; j<${#shard_patterns[@]}; j++)); do [ "${shard_patterns[$j]}" = "$pattern" ] && slot=$j; done
+        if [ "$slot" -lt 0 ]; then
+          [ "$count" -ge "$MODEL_LIMIT" ] && continue
+          slot=${#shard_patterns[@]}; shard_patterns[$slot]=$pattern; shard_counts[$slot]=0; shard_expected[$slot]=$expected; shard_indices[$slot]='|'
+          count=$((count+1))
+        fi
+        shard_counts[$slot]=$((shard_counts[$slot]+1)); shard_indices[$slot]="${shard_indices[$slot]}$index|"
+        continue
+      fi
+    fi
+    [ "$count" -ge "$MODEL_LIMIT" ] && continue
     printf '  %s [filename]: %q\n' "$role" "$path"
     if [[ "$name" =~ (IQ[1-4]_[A-Za-z0-9_]+|Q[1-8]_[A-Za-z0-9_]+|BF16|F16|FP16|F32) ]]; then
       printf '    Quant filename hint: %s [inferred]; publisher: unknown\n' "${BASH_REMATCH[1]}"
     fi
-    count=$((count+1)); [ "$count" -ge "$MODEL_LIMIT" ] && { printf '  File row limit reached.\n'; break; }
+    count=$((count+1))
   done < <(for ((i=1; i<${#args[@]}; i+=2)); do
-    find "${args[$i]}" -xdev \( -name .git -o -name node_modules -o -name .venv -o -name site-packages -o -name .ssh -o -name secrets -o -name credentials \) -prune -o -type f -print0 2>/dev/null
+    find "${args[$i]}" -xdev \( -name .git -o -name node_modules -o -name '.venv*' -o -name site-packages -o -name 'archive-v*' -o -name tests -o -name test -o -name examples -o -name sample_data -o -name test_data -o -name .ssh -o -name secrets -o -name credentials \) -prune -o -type f -print0 2>/dev/null
   done)
+  for ((j=0; j<${#shard_patterns[@]}; j++)); do
+    printf '  Model set: %q\n' "${shard_patterns[$j]}"
+    printf '  Shards: %s/%s present; ' "${shard_counts[$j]}" "${shard_expected[$j]}"
+    missing=0
+    for ((index=1; index<=${shard_expected[$j]}; index++)); do
+      case "${shard_indices[$j]}" in *"|$index|"*) ;; *)
+        [ "$missing" -eq 0 ] && printf 'missing: '
+        [ "$missing" -lt 20 ] && printf '%05d ' "$index"
+        missing=$((missing+1)) ;;
+      esac
+    done
+    [ "$missing" -eq 0 ] && printf 'complete filename set'
+    [ "$missing" -gt 20 ] && printf '...'
+    printf '\n  Header identity and total size unavailable in filename-only mode.\n'
+  done
+  [ "$count" -ge "$MODEL_LIMIT" ] && printf '  Model row limit reached; additional models may be omitted.\n'
 }
 runtime_context() {
   local tool path any=false

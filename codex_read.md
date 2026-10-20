@@ -144,3 +144,58 @@ directory usage for sparse files.
 Format references: [GGUF specification](https://github.com/ggml-org/ggml/blob/master/docs/gguf.md),
 [llama.cpp metadata/file-type constants](https://github.com/ggml-org/llama.cpp/blob/master/gguf-py/gguf/constants.py),
 and [Ollama model manifest handling](https://github.com/ollama/ollama/blob/main/server/images.go).
+
+## Group sharded models in reports
+
+The default inventory now reports one model set for numbered
+`NAME-00001-of-000NN.gguf`, `.safetensors` and `.bin` files in the same directory.
+Different directory paths, prefixes, quantization names, total counts and formats
+remain separate. Projectors and MTP sidecars are not combined with base weights.
+Each set reports its filename pattern, discovered/expected count, missing indices,
+combined apparent size and one representative header file. Header parsing selects
+the lowest available shard; model limits and sorting apply after grouping.
+Filename completeness means the numbered parts were discovered, not that tensors
+or shard contents are valid. Sizes include only discovered parts; metadata and
+identity fields are not verified on every shard. Unnumbered files remain individual.
+
+Filename-only Linux fallback also groups shards and reports missing parts, but
+cannot provide combined sizes/header identity; Windows provider fallback groups
+and sums sizes without header identity. Fallback row limits retain their existing
+restrictions. Standard five-digit split naming is supported; arbitrary naming
+schemes and index-manifest-only shard associations are not guessed.
+
+Validation: native Linux 22 passed plus one Windows-only skip; Windows model suite
+five passed plus one Unix-only skip. Added checks cover group size/ranking before
+limits, missing parts, separate directories, safetensors sets, separate projectors
+and both dependency-restricted fallbacks. Existing script-block workflow remains.
+
+## Remove package-data and gateway false positives
+
+The user's Windows report revealed SciPy/Matplotlib NPZ data files and Python
+`.pth` loaders mislabeled as weights, vocabulary GGUFs mislabeled as models, and
+cached dependency proxy modules mislabeled as gateways. Inventory classification
+now excludes test/example/sample trees, requires a model-like basename for NPZ
+candidates outside dependency stores, excludes Python package `.pth` loaders, and
+classifies `ggml-vocab-*.gguf` separately as tokenizer/vocabulary assets.
+
+Generic proxy filenames do not imply an AI gateway. Gateway candidate names must
+identify a gateway/frontdoor/LiteLLM/OpenAI server, or reside in a known/explicit
+gateway root; dependency caches and environment packages do not qualify. Explicit
+gateway hints survive parent-root deduplication. Directory sizing is unchanged;
+these exclusions apply to file identity, not storage accounting.
+
+Runtime libraries and vocabulary assets are summarized by containing installation
+directory (LM Studio backend/version directories are recognized), with count,
+combined apparent size, detected backend families and at most three example names.
+Different runtime installations/versions remain visible. These are path-derived
+installation candidates, not proof of active backend use. Known vocabulary naming
+is separated without claiming universal tokenizer detection. The Windows scanner
+types are versioned so repeated script-block runs cannot reuse an older classifier.
+
+Validation: Linux 25 passed plus one Windows-only skip; Windows model/classification
+suite eight passed plus one Unix-only skip, and six traversal fixtures passed.
+A path-only replay of the user's 680 reported entries excludes 556 false-positive
+candidates, retains five model candidates, separates 19 vocabulary assets and
+retains 100 reported backend files for grouped presentation. This replay opens no
+AppData/model files and does not claim those five candidates have verified contents.
+Sharded-model grouping remains covered. Changes are in the same pending PR #5.
