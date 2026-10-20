@@ -93,3 +93,54 @@ the metadata enumerator (three repetitions). This isolates enumeration cost;
 it does not promise a fixed whole-audit speedup on other disks or machines.
 
 The existing `README.md` remains unchanged under its append-only rule.
+
+## Model identity inventory (2026-10-20)
+
+The original pre-session baseline (`136d83f`) listed Ollama models and Windows
+Foundry caches. The first refactors removed those listings and overemphasized
+directory sizes. Both standalone scripts now inventory files by default within
+the discovered/selected roots, retaining the existing curl/PowerShell script-block
+entry points. No separate backend or neighboring runtime files are required.
+
+- Models: path, apparent file length, format, weights/projector/MTP/n-gram role,
+  model name, architecture, quantization, declared author/organization and quantizer.
+- Evidence: GGUF headers, safetensors descriptors and adjacent standard model
+  `config.json` metadata, offline Ollama manifest references, HF/LM Studio paths.
+  Repository/uploader is separate from declared author. Filename roles and quants
+  are labeled inferred; no universal MTP/n-gram signature is claimed.
+- Runtime and gateway candidates: separate sections for CUDA, ROCm/HIP, Vulkan,
+  Metal/MLX, DirectML, GGML/inference libraries and gateway/frontend code paths.
+  Presence does not prove a backend is loaded or a service running. Tests/examples
+  are excluded from gateway matching; arbitrary filenames still need `--root`.
+- Split GGUF files missing identity fields may inherit them from the first shard;
+  the report explicitly identifies this source. No tensor validation occurs.
+- Linux uses an embedded optional Python 3 stdlib reader. Without installed
+  Python it still inventories filename candidates, with unknown header fields.
+  Windows enriches candidates collected during its existing .NET traversal;
+  restricted environments without Add-Type get a filename-only provider fallback.
+- Controls: `--no-inventory` / `-NoInventory`, `--model-limit N` / `-ModelLimit N`
+  (default 500), `--gateway-root DIR` / `-GatewayRoot DIR` and
+  `AI_AUDIT_GATEWAY_ROOT`. Planning mode never inspects headers.
+
+Metadata work is bounded: GGUF positions at most 256 MiB, at most 100,000 keys
+and 2,000,000 array elements/steps; safetensors headers at most 8 MiB and model
+JSON at most 1 MiB. No hashing, tensor loading, model startup, configuration
+execution or gateway secret reads. Linux skips dependency/test trees and caps
+file inspection at 300,000 entries; Windows caps retained candidates per kind
+per root at 10,000. Limits and unsupported/malformed metadata are explicit.
+These bounds can leave fields unknown. Discovery is not a whole-disk search.
+
+Binary fixture tests cover little/big endian GGUF, large skipped arrays,
+conflicting header/filename quants, shard identity inheritance, mmproj/MTP/ngram,
+safetensors/config metadata, offline Ollama blobs, runtime/gateway candidates,
+corrupt headers and inventory opt-out. Native Linux passes 20 total cases;
+Windows passes its six traversal cases and two model-metadata cases.
+Native macOS remains unverified. A read-only Artemis sample identified actual
+projectors/MTP files and header Q6_K/Q5_K_M/Q8_0/Q4_K_M/F16 quants. One file
+named `mtp-Qwen3.8-27B-Q4_0.gguf` declares Q4_K_S, demonstrating why the report
+keeps filename hints separate. Per-file apparent lengths can exceed allocated
+directory usage for sparse files.
+
+Format references: [GGUF specification](https://github.com/ggml-org/ggml/blob/master/docs/gguf.md),
+[llama.cpp metadata/file-type constants](https://github.com/ggml-org/llama.cpp/blob/master/gguf-py/gguf/constants.py),
+and [Ollama model manifest handling](https://github.com/ollama/ollama/blob/main/server/images.go).
