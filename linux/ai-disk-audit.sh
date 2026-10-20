@@ -7,6 +7,9 @@ COMPREHENSIVE=false
 HOME_ONLY=false
 LIST_ROOTS=false
 DIAGNOSTICS=false
+NO_INVENTORY=false
+MODEL_LIMIT=500
+GATEWAY_ROOT=${AI_AUDIT_GATEWAY_ROOT:-}
 LEGACY_REPORT=false
 REPORT_PATH=
 MODEL_ROOT=${AI_AUDIT_MODEL_ROOT:-}
@@ -33,12 +36,16 @@ Usage: bash ai-disk-audit.sh [options]
       --storage-root DIR Look for AI folders below a storage parent (repeatable)
       --home-only        Skip automatic system/shared-storage discovery
       --list-roots       Show selected roots without measuring file trees
+      --no-inventory     Only measure directories; skip file identification
+      --model-limit N    Maximum model rows and header inspections (default 500)
+      --gateway-root DIR Include gateway code (or AI_AUDIT_GATEWAY_ROOT)
       --diagnostics      Show traversal counts and planning statistics
   -h, --help             Show this help
 
 Quick mode includes known model/cache locations, named AI projects, Python
 environments and AI directories on shared storage. Discovery examines directory
-names at bounded depth; it never reads model contents, secrets or service config.
+names at bounded depth. Optional installed Python enriches bounded model headers
+and manifests; tensors, secrets and gateway settings are never loaded.
 No cleanup, sudo, daemon calls, installation or adjacent runtime files are used.
 EOF
 }
@@ -48,12 +55,15 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     -c|--comprehensive) COMPREHENSIVE=true; shift ;;
     -r|--report) LEGACY_REPORT=true; shift ;;
+    --no-inventory) NO_INVENTORY=true; shift ;;
     --home-only) HOME_ONLY=true; shift ;;
     --list-roots) LIST_ROOTS=true; shift ;;
     --diagnostics) DIAGNOSTICS=true; shift ;;
-    --root|--storage-root|--model-root|--strata-root|--report-path)
+    --root|--storage-root|--model-root|--strata-root|--report-path|--model-limit|--gateway-root)
       need_value "$1" "$#" "${2:-}"
       case "$1" in
+        --model-limit) MODEL_LIMIT=$2 ;;
+        --gateway-root) GATEWAY_ROOT=$2 ;;
         --root) CUSTOM_ROOTS[${#CUSTOM_ROOTS[@]}]=$2 ;;
         --storage-root) STORAGE_ROOTS[${#STORAGE_ROOTS[@]}]=$2 ;;
         --model-root) MODEL_ROOT=$2 ;;
@@ -67,6 +77,8 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 [ "$LEGACY_REPORT" = true ] && [ -n "$REPORT_PATH" ] && fail 'use either --report or --report-path'
+case "$MODEL_LIMIT" in ''|*[!0-9]*) fail '--model-limit must be 1..10000' ;; esac
+[ "${#MODEL_LIMIT}" -le 5 ] && [ "$MODEL_LIMIT" -ge 1 ] && [ "$MODEL_LIMIT" -le 10000 ] || fail '--model-limit must be 1..10000'
 for tool in du awk sort; do command -v "$tool" >/dev/null 2>&1 || fail "required utility not found: $tool"; done
 
 add_root() {
@@ -238,6 +250,10 @@ filesystem_id() {
   [ -n "$value" ] && printf 'df:%s' "$value"
 }
 prepare_roots() {
+  add_root Gateways 'Gateway code' "$GATEWAY_ROOT" true
+  for gateway in "$HOME/.hermes" "$HOME/litellm" "$HOME/open-webui" "$HOME/local-ai"; do
+    [ -d "$gateway" ] && add_root Gateways 'Gateway/frontend candidate' "$gateway"
+  done
   local i j raw path seen parent
   local candidates=() groups=() labels=() devices=()
   for ((i=0; i<${#PATHS[@]}; i++)); do
@@ -279,8 +295,294 @@ prepare_roots() {
     j=${#SELECTED_PATHS[@]}; SELECTED_PATHS[$j]=$path; SELECTED_GROUPS[$j]=${groups[$i]}; SELECTED_LABELS[$j]=${labels[$i]}
   done
 }
+inventory() {
+  [ "$NO_INVENTORY" = true ] && return
+  local i group path name role count=0
+  local args=()
+  for ((i=0; i<${#SELECTED_PATHS[@]}; i++)); do
+    group=${SELECTED_GROUPS[$i]}
+    if [ "$group" = Caches ]; then
+      case "${SELECTED_LABELS[$i]}" in *Hugging*|*hugging*|*HF*|*Torch*|*torch*|*vLLM*|*vllm*) group=ModelCache ;; *) continue ;; esac
+    fi
+    case "$group" in Toolchains|Containers) continue ;; esac
+    args[${#args[@]}]=$group; args[${#args[@]}]=${SELECTED_PATHS[$i]}
+  done
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$MODEL_LIMIT" "$HOME_ONLY" "${args[@]}" <<'AI_AUDIT_METADATA_PY'
+"""Embedded, optional Linux metadata enrichment. No dependencies or tensor reads."""
+import collections, glob, json, os, re, struct, sys
+from pathlib import Path
+
+LIMIT=int(sys.argv[1]); HOME_ONLY=sys.argv[2]=='true'
+ROOTS=list(zip(sys.argv[3::2],sys.argv[4::2]))
+MAX_HEADER=8*1024*1024
+MAX_METADATA=256*1024*1024
+FT={0:'F32',1:'F16',2:'Q4_0',3:'Q4_1',7:'Q8_0',8:'Q5_0',9:'Q5_1',10:'Q2_K',11:'Q3_K_S',12:'Q3_K_M',13:'Q3_K_L',14:'Q4_K_S',15:'Q4_K_M',16:'Q5_K_S',17:'Q5_K_M',18:'Q6_K',19:'IQ2_XXS',20:'IQ2_XS',21:'Q2_K_S',22:'IQ3_XS',23:'IQ3_XXS',24:'IQ1_S',25:'IQ4_NL',26:'IQ3_S',27:'IQ3_M',28:'IQ2_S',29:'IQ2_M',30:'IQ4_XS',31:'IQ1_M',32:'BF16',36:'TQ1_0',37:'TQ2_0',38:'MXFP4_MOE',39:'NVFP4',40:'Q1_0',41:'Q2_0'}
+QUANT=re.compile(r'(?i)(?:UD-)?(?:IQ[1-4]_[A-Z0-9_]+|Q[1-8](?:_[A-Z0-9]+)+|TQ[12]_0|BF16|F16|FP16|F32|FP32|FP8|MXFP4(?:_MOE)?|NVFP4)')
+SECRET={'.ssh','.gnupg','credentials','secrets','.env'}
+PRUNE=SECRET|{'.git','node_modules','__pycache__','.venv','venv','site-packages','sessions','logs','conversations','tests','test','examples'}
+records={}; issues=[]; configs={}; counts=collections.Counter(); manifest_roots=set(); shard_headers={}
+
+def clean(value):
+    return re.sub(r'[\x00-\x1f\x7f]', '?', str(value))[:240]
+def safe(path):
+    return not any(p.lower() in SECRET or p.lower().endswith(('.pem','.key')) for p in Path(path).parts)
+def small_json(path,limit=1024*1024):
+    path=Path(path)
+    if not safe(path.resolve()) or path.stat().st_size>limit: return {}
+    with path.open('rb') as f: value=json.load(f)
+    return value if isinstance(value,dict) else {}
+def gguf(path):
+    meta={}; steps=[0]
+    with open(path,'rb') as f:
+        if f.read(4) not in (b'GGUF',b'FUGG'): return {},''
+        version=f.read(4); endian='<' if int.from_bytes(version,'little') in (2,3) else '>'
+        if int.from_bytes(version,'little' if endian=='<' else 'big') not in (2,3): return {},'unsupported GGUF version'
+        def number(fmt):
+            n=struct.calcsize(fmt); data=f.read(n)
+            if len(data)!=n: raise ValueError('truncated metadata')
+            return struct.unpack(endian+fmt,data)[0]
+        def skip(n):
+            if n<0 or f.tell()+n>min(os.fstat(f.fileno()).st_size,MAX_METADATA): raise ValueError('metadata limit/truncation')
+            f.seek(n,1)
+        def string(keep):
+            n=number('Q')
+            if n>MAX_METADATA or f.tell()+n>MAX_METADATA: raise ValueError('metadata string limit')
+            if keep:
+                if n>4096: skip(n); return '(metadata string omitted: too long)'
+                data=f.read(n)
+                if len(data)!=n: raise ValueError('truncated string')
+                return data.decode('utf-8','replace')
+            skip(n)
+        def value(kind,keep=False,depth=0):
+            steps[0]+=1
+            if steps[0]>2000000 or depth>2: raise ValueError('metadata item limit')
+            formats={0:'B',1:'b',2:'H',3:'h',4:'I',5:'i',6:'f',7:'?',10:'Q',11:'q',12:'d'}
+            if kind in formats:
+                if keep:return number(formats[kind])
+                skip(struct.calcsize(formats[kind])); return None
+            if kind==8:return string(keep)
+            if kind==9:
+                sub=number('I'); count=number('Q')
+                if count>2000000: raise ValueError('metadata array limit')
+                if sub in formats:skip(count*struct.calcsize(formats[sub]))
+                else:
+                    for _ in range(count):value(sub,False,depth+1)
+                return None
+            raise ValueError('unknown metadata type')
+        try:
+            number('Q'); total=number('Q')
+            if total>100000:raise ValueError('metadata key limit')
+            for _ in range(total):
+                key=string(True); kind=number('I')
+                keep=key.endswith('.nextn_predict_layers') or key in {'general.name','general.author','general.organization','general.architecture','general.type','general.file_type','general.quantized_by','clip.projector_type'}
+                data=value(kind,keep)
+                if keep and data is not None:meta[key]=data
+            return meta,''
+        except (ValueError,OSError,struct.error) as e:return meta,str(e)
+
+def classify(path):
+    name=path.name.lower(); lower=str(path).replace('\\','/').lower(); ext=path.suffix.lower()
+    role=''; fmt=''; source='filename'; model=True
+    if ('ngram' in name or 'n-gram' in name) and ext in {'.bin','.gguf','.table'}:role='n-gram table candidate';fmt=ext.lstrip('.').upper() or 'unknown'
+    elif ('mmproj' in name or 'projector' in name) and ext in {'.gguf','.bin','.safetensors'}:role='multimodal projector candidate';fmt=ext.lstrip('.').upper()
+    elif re.search(r'(^|[-_.])mtp([-_.]|$)',name) and ext in {'.gguf','.bin','.safetensors'}:role='MTP sidecar candidate';fmt=ext.lstrip('.').upper()
+    elif ext in {'.gguf','.safetensors','.onnx','.pt','.pth','.ckpt','.tflite','.npz','.mlmodel'}:role='model/weights';fmt=ext.lstrip('.').upper()
+    elif name.startswith(('pytorch_model','adapter_model')) and ext=='.bin':role='adapter weights' if 'adapter' in name else 'model weights';fmt='BIN'
+    elif '/blobs/' in lower and re.fullmatch(r'(?:sha256-)?[a-f0-9]{40,64}',name):role='cached model blob candidate';fmt='unknown'
+    elif re.search(r'(ggml|cuda|cudnn|cublas|amdhip|hipblas|hiprtc|rocblas|vulkan|directml|mlx|metal)',name) and (re.search(r'\.(so(?:\..*)?|dll|dylib|metallib|metal)$',name)):
+        backend='ROCm/HIP' if re.search('hip|rocblas|rocm',name) else 'CUDA' if re.search('cuda|cudnn|cublas',name) else 'Vulkan' if 'vulkan' in name else 'Metal/MLX' if re.search('metal|mlx',name) else 'DirectML' if 'directml' in name else 'GGML/CPU'
+        return {'role':backend+' backend library','format':ext.lstrip('.').upper(),'source':'filename/path','model':False,'category':'Backends'}
+    elif (re.search(r'gateway|proxy|litellm|frontdoor|openai[-_]server',name) and ext in {'.py','.js','.sh','.ps1','.exe',''}) and not any(p in lower for p in ['/site-packages/','/node_modules/']):
+        return {'role':'gateway/API frontend candidate','format':ext.lstrip('.').upper() or 'executable/script','source':'filename/path','model':False,'category':'Gateways'}
+    elif name in {'llama-server','llama-server.exe','ollama','ollama.exe','local-ai','local-ai.exe'}:
+        return {'role':'inference server executable','format':'executable','source':'filename/path','model':False,'category':'Backends'}
+    if not role:return None
+    return {'role':role,'format':fmt,'source':source,'model':model,'category':'Models'}
+
+def add(path,reference=''):
+    try:
+        p=Path(path); actual=p.resolve()
+        if not safe(actual) or not p.is_file():return
+        key=str(actual)
+        if key in records:
+            if reference:records[key]['refs'].add(reference)
+            if Path(records[key]['path']).suffix=='' and p.suffix:
+                records[key]['path']=str(p)
+            return
+        info=classify(p)
+        if not info:return
+        info.update(path=str(p),actual=key,size=p.stat().st_size,refs={reference} if reference else set())
+        records[key]=info
+    except OSError as e:issues.append('Cannot inventory '+str(path)+': '+type(e).__name__)
+
+def manifests(base):
+    if str(base) in manifest_roots:return
+    manifest_roots.add(str(base))
+    folder=base/'manifests'; blobs=base/'blobs'
+    if not folder.is_dir() or not blobs.is_dir():return
+    found=0
+    for parent,dirs,files in os.walk(folder,followlinks=False):
+        dirs[:]=[d for d in dirs if d not in PRUNE and not (Path(parent)/d).is_symlink()]
+        for name in files:
+            found+=1
+            if found>1000:issues.append('Ollama manifest limit reached: '+str(folder));return
+            path=Path(parent)/name
+            try:
+                data=small_json(path)
+                for layer in data.get('layers',[]):
+                    media=str(layer.get('mediaType',''))
+                    if not any(x in media for x in ['image.model','image.projector','image.adapter','image.tensor']):continue
+                    digest=str(layer.get('digest',''))
+                    if not re.fullmatch(r'sha256:[a-f0-9]{64}',digest):continue
+                    target=blobs/digest.replace(':','-')
+                    rel=str(path.relative_to(folder)).replace('\\','/')
+                    add(target,'Ollama manifest: '+rel)
+                    item=records.get(str(target.resolve()))
+                    if item and 'projector' in media:item['role']='multimodal projector (manifest)';item['source']='Ollama manifest'
+                    if item and 'adapter' in media:item['role']='adapter weights (manifest)';item['source']='Ollama manifest'
+            except (OSError,ValueError,TypeError):issues.append('Unreadable/invalid Ollama manifest: '+str(path))
+
+visited=set(); entries=0
+for group,raw in ROOTS:
+    if entries>300000:break
+    root=Path(raw)
+    # Package/compile caches are measured by the size scan, not walked again.
+    if group in {'Toolchains','Containers'}:continue
+    if group=='Environments':
+        for pattern in ['lib/python*/site-packages/torch/lib/*','lib/python*/site-packages/nvidia/*/lib/*','lib/python*/site-packages/onnxruntime/capi/*','lib/python*/site-packages/llama_cpp/lib/*','lib/python*/site-packages/mlx/lib/*']:
+            for path in glob.glob(str(root/pattern)):add(path)
+        continue
+    if group=='Caches':continue
+    for base in (root,root/'models'):manifests(base)
+    for parent,dirs,files in os.walk(root,followlinks=False):
+        try:
+            st=os.stat(parent);key=(st.st_dev,st.st_ino)
+            if key in visited:dirs[:]=[];continue
+            if st.st_dev!=root.stat().st_dev:dirs[:]=[];continue
+            visited.add(key)
+        except OSError:dirs[:]=[];continue
+        dirs[:]=[d for d in dirs if d.lower() not in PRUNE and not (Path(parent)/d).is_symlink()]
+        if (Path(parent)/'manifests').is_dir() and (Path(parent)/'blobs').is_dir():manifests(Path(parent))
+        for name in files:
+            entries+=1
+            if entries>300000:issues.append('Inventory entry budget reached; use a narrower --root');break
+            path=Path(parent)/name
+            if classify(path):add(path)
+        if entries>300000:break
+
+if not HOME_ONLY:
+    for pattern in ['/opt/rocm/lib/libamdhip64.so*','/opt/rocm/core-*/lib/libamdhip64.so*','/usr/local/cuda*/lib64/libcudart.so*','/usr/lib/*/libvulkan.so*','/usr/lib/libvulkan.so*']:
+        for path in glob.glob(pattern):add(path)
+    if Path('/System/Library/Frameworks/Metal.framework').is_dir():
+        records['Metal.framework']={'category':'Backends','model':False,'role':'Metal GPU framework','format':'framework','source':'installed path','path':'/System/Library/Frameworks/Metal.framework','size':0,'refs':set()}
+
+def enrich(item):
+    path=Path(item['path']);meta={};note='';quant='unknown';publisher='unknown';repo='unknown';dtype=''
+    hint=QUANT.search(path.name)
+    item['hint']=hint.group(0) if hint else ''
+    try:
+        with path.open('rb') as f:magic=f.read(4)
+        if magic in (b'GGUF',b'FUGG'):
+            item['format']='GGUF';meta,note=gguf(path)
+            first=path.with_name(re.sub(r'-\d{5}-of-(\d{5})\.gguf$',r'-00001-of-\1.gguf',path.name))
+            if first!=path and first.is_file() and safe(first.resolve()) and 'general.file_type' not in meta:
+                if str(first) not in shard_headers:shard_headers[str(first)]=gguf(first)[0]
+                for key,value in shard_headers[str(first)].items():meta.setdefault(key,value)
+                note=(note+'; ' if note else '')+'missing identity fields inherited from first-shard GGUF header; tensors not validated'
+            item['name']=clean(meta.get('general.name',path.name))
+            publisher=clean(meta.get('general.organization') or meta.get('general.author') or 'unknown')
+            if publisher!='unknown':publisher+=' [GGUF declared]'
+            if 'general.file_type' in meta:quant=FT.get(meta['general.file_type'],'file_type='+str(meta['general.file_type']))+' [GGUF]'
+            if meta.get('general.type')=='mmproj' or meta.get('general.architecture') in {'clip','mmproj'} or 'clip.projector_type' in meta:
+                item['role']='multimodal projector/encoder [GGUF]'
+            elif str(meta.get('general.type','')).lower()=='mtp':item['role']='MTP sidecar [GGUF]'
+            elif item['role']=='cached model blob candidate':item['role']='model weights [GGUF]'
+            if meta.get('general.quantized_by'):item['quantizer']=clean(meta['general.quantized_by'])+' [GGUF declared]'
+        elif item['format']=='GGUF':note='GGUF extension but invalid/missing GGUF magic'
+        elif item['format']=='SAFETENSORS' or item['role']=='cached model blob candidate':
+            with path.open('rb') as f:
+                n=struct.unpack('<Q',f.read(8))[0]
+                if n>MAX_HEADER or n<2 or n+8>path.stat().st_size:raise ValueError('safetensors header limit/unknown blob format')
+                header=json.loads(f.read(n))
+            if not isinstance(header,dict):raise ValueError('invalid safetensors header object')
+            dtype=','.join(sorted({str(v.get('dtype')) for k,v in header.items() if k!='__metadata__' and isinstance(v,dict) and 'dtype' in v and isinstance(v.get('shape'),list) and isinstance(v.get('data_offsets'),list) and len(v['data_offsets'])==2}))
+            if not dtype:raise ValueError('no tensor descriptors')
+            item['format']='SAFETENSORS';item['role']='model/tensor weights [header]' if item['role']=='cached model blob candidate' else item['role']
+        match=re.search(r'(?:^|[/\\])models--([^/\\]+)',str(path))
+        if match:repo=match.group(1).replace('--','/',1)+' [cache path; uploader, not verified publisher]'
+        elif '.lmstudio' in path.parts:
+            parts=list(path.parts)
+            if 'models' in parts:
+                i=parts.index('models')
+                if len(parts)>i+3:repo=parts[i+1]+'/'+parts[i+2]+' [LM Studio path]'
+        config=path.parent/'config.json'
+        if config.is_file():
+            key=str(config)
+            if key not in configs:configs[key]=small_json(config)
+            q=configs[key].get('quantization_config',{})
+            if isinstance(q,dict) and q.get('quant_method') and quant=='unknown':
+                quant=clean(q['quant_method'])+(' '+str(q['bits'])+'-bit' if 'bits' in q else '')+' [config]'
+    except (OSError,ValueError,struct.error,TypeError) as e:note=str(e)[:140]
+    item.update(quant=quant,publisher=publisher,repo=repo,dtype=dtype,note=note,arch=clean(meta.get('general.architecture',configs.get(str(path.parent/'config.json'),{}).get('model_type','unknown'))),mtp={k:v for k,v in meta.items() if k.endswith('.nextn_predict_layers')})
+
+print('\n=== Model files and sidecars ===')
+models=sorted((i for i in records.values() if i['model']),key=lambda i:i['size'],reverse=True)
+for item in models[:LIMIT]:
+    enrich(item)
+    if item['role']=='cached model blob candidate' and not item['refs'] and item['format']=='unknown':continue
+    print('\n  File: '+json.dumps(item['path'],ensure_ascii=False))
+    print('  Role: '+item['role']+'; format: '+item['format']+'; size: %.3f GiB'%(item['size']/2**30))
+    print('  Model: '+item.get('name',Path(item['path']).name)+'; architecture: '+item['arch'])
+    print('  Quant: '+item['quant']+('; filename hint: '+item['hint']+' [inferred]' if item['hint'] else ''))
+    print('  Publisher/author: '+item['publisher']+'; repository: '+item['repo'])
+    if item.get('quantizer'):print('  Quantizer: '+item['quantizer'])
+    for key,value in item.get('mtp',{}).items():print('  MTP capability: '+clean(key)+'='+clean(value)+' [GGUF; not proof of a separate sidecar]')
+    if item['dtype']:print('  Tensor dtypes: '+item['dtype']+' [header; not a quantization-method guarantee]')
+    for ref in sorted(item['refs']):print('  Reference: '+clean(ref))
+    if item['note']:print('  Metadata note: '+clean(item['note']))
+if not models:print('  No recognized model files in the selected locations. Add --root for another store.')
+if len(models)>LIMIT:print('  Model rows limited to %s of %s candidates; increase --model-limit.'%(LIMIT,len(models)))
+for category in ['Backends','Gateways']:
+    items=sorted((i for i in records.values() if i['category']==category),key=lambda i:i['size'],reverse=True)
+    print('\n=== '+('Backend/runtime files' if category=='Backends' else 'Gateway/API frontend files')+' ===')
+    for item in items[:100]:print('  '+item['role']+' ['+item['source']+']: '+json.dumps(item['path'],ensure_ascii=False))
+    if not items:print('  No matching files in the selected locations; this does not prove the software is absent.')
+    if len(items)>100:print('  Showing 100 of %s matching files.'%len(items))
+for issue in issues[:20]:print('  INVENTORY ISSUE: '+clean(issue))
+print('\nIdentity comes from bounded headers/manifests where available; filename/path roles are candidates.')
+print('Repository/uploader, model author and quantizer are distinct. Unknown fields remain unknown.')
+print('Per-file sizes are apparent lengths, which can exceed allocated disk use for sparse files.')
+print('No tensors are loaded, models hashed, services started, or gateway secrets read.')
+AI_AUDIT_METADATA_PY
+    [ "$?" -eq 0 ] && return
+    printf '\nMetadata enrichment failed; using filename inventory.\n'
+  fi
+  printf '\n=== File inventory (filename evidence only) ===\n'
+  printf 'Python 3 header inspection unavailable. Quant/publisher/architecture remain unknown.\n'
+  while IFS= read -r -d '' path; do
+    name=${path##*/}; role=
+    case "$name" in
+      *ngram*.bin|*ngram*.table|*n-gram*.bin) role='n-gram table candidate' ;;
+      *mmproj*.gguf|*projector*.gguf) role='multimodal projector candidate' ;;
+      *mtp*.gguf|*mtp*.bin) role='MTP sidecar candidate' ;;
+      *.gguf|*.safetensors|*.onnx|*.pth|*.pt|*.ckpt|pytorch_model*.bin|adapter_model*.bin) role='model/weights candidate' ;;
+      *cuda*.so*|*cublas*.so*|*hip*.so*|*rocblas*.so*|*vulkan*.so*|*ggml*.so*|*metal*.dylib|*.metallib) role='backend library candidate' ;;
+      *gateway*.py|*proxy*.py|*frontdoor*.py|*litellm*.py) role='gateway/frontend candidate' ;;
+    esac
+    [ -n "$role" ] || continue
+    printf '  %s [filename]: %q\n' "$role" "$path"
+    if [[ "$name" =~ (IQ[1-4]_[A-Za-z0-9_]+|Q[1-8]_[A-Za-z0-9_]+|BF16|F16|FP16|F32) ]]; then
+      printf '    Quant filename hint: %s [inferred]; publisher: unknown\n' "${BASH_REMATCH[1]}"
+    fi
+    count=$((count+1)); [ "$count" -ge "$MODEL_LIMIT" ] && { printf '  File row limit reached.\n'; break; }
+  done < <(for ((i=1; i<${#args[@]}; i+=2)); do
+    find "${args[$i]}" -xdev \( -name .git -o -name node_modules -o -name .venv -o -name site-packages -o -name .ssh -o -name secrets -o -name credentials \) -prune -o -type f -print0 2>/dev/null
+  done)
+}
 runtime_context() {
   local tool path any=false
+  [ -d /System/Library/Frameworks/Metal.framework ] && printf '\nMetal GPU framework: /System/Library/Frameworks/Metal.framework [installed path]\n'
   printf '\nDetected tools (presence only; no service queries):\n'
   for tool in ollama lms llama-server python3 uv conda docker podman nvcc hipcc; do
     path=$(command -v "$tool" 2>/dev/null)
@@ -342,6 +644,7 @@ scan() {
     for raw in "${ISSUES[@]}"; do printf '  ERROR %q\n' "$raw"; done
   fi
   [ "$errors" -gt 0 ] && printf '\nScan errors: %s directories could not be completely sized.\n' "$errors"
+  inventory
   runtime_context
   printf '\nFilesystem capacity for the scanned locations:\n'
   if command -v df >/dev/null 2>&1; then
