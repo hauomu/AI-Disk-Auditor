@@ -30,10 +30,10 @@ class ModelInventory(unittest.TestCase):
             if k.startswith(('AI_AUDIT_','HF_','HUGGINGFACE_','UV_','OLLAMA_','TORCH_','XDG_','VLLM_')):self.env.pop(k)
         for k in ('HOME','USERPROFILE','LOCALAPPDATA','APPDATA','ProgramData','ProgramFiles','TEMP','TMP'):
             p=self.base/k;p.mkdir();self.env[k]=str(p)
-    def run_audit(self,extra=''):
+    def run_audit(self,extra='',prefix=''):
         if os.name=='nt':
             q=lambda s:"'"+str(s).replace("'","''")+"'"
-            code='[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); & ([scriptblock]::Create([IO.File]::ReadAllText('+q(REPO/'windows/ai-disk-audit.ps1')+'))) -HomeOnly -Root '+q(self.store)+' '+extra
+            code=prefix+'[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); & ([scriptblock]::Create([IO.File]::ReadAllText('+q(REPO/'windows/ai-disk-audit.ps1')+'))) -HomeOnly -Root '+q(self.store)+' '+extra
             cmd=[shutil.which('powershell'),'-NoProfile','-NonInteractive','-EncodedCommand',base64.b64encode(code.encode('utf-16le')).decode()]
         else:cmd=['bash',str(REPO/'linux/ai-disk-audit.sh'),'--home-only','--root',str(self.store)]+extra.split()
         r=subprocess.run(cmd,env=self.env,text=True,capture_output=True,encoding='utf-8',timeout=60)
@@ -54,7 +54,7 @@ class ModelInventory(unittest.TestCase):
         manifest=self.store/'ollama'/'manifests'/'registry.ollama.ai'/'library'/'fixture'/'latest'
         manifest.parent.mkdir(parents=True);manifest.write_text(json.dumps({'layers':[{'mediaType':'application/vnd.ollama.image.model','digest':'sha256:'+digest}]}))
         out=self.run_audit()
-        for value in ('Fixture Model','Declared Author','Quantizer','Q4_K_M [GGUF]','filename hint: Q8_0','Uploader/Repository','multimodal projector/encoder [GGUF]','MTP sidecar candidate','n-gram table candidate','Vulkan','gateway.py','Ollama manifest:','Manifest Model','MTP capability:','inherited from first-shard GGUF'):
+        for value in ('Fixture Model','Declared Author','Quantizer','Q4_K_M [GGUF]','filename hint: Q8_0','Uploader/Repository','multimodal projector/encoder [GGUF]','MTP sidecar candidate','n-gram table candidate','Vulkan','gateway.py','Ollama manifest:','Manifest Model','MTP capability:','Shards: 2/2 present; complete filename set'):
             self.assertIn(value,out)
         self.assertNotIn('SECRET_SENTINEL',out)
     def test_safetensors_config_corruption_and_opt_out(self):
@@ -67,6 +67,37 @@ class ModelInventory(unittest.TestCase):
         for value in ('BF16 [header','awq 4-bit [config]','fixture-arch','Metadata note:'):self.assertIn(value,out)
         out=self.run_audit('-NoInventory' if os.name=='nt' else '--no-inventory')
         self.assertNotIn('Model files and sidecars',out)
+    def test_shards_group_before_limit_and_sizes_are_summed(self):
+        for n in (1,2):
+            path=self.store/('large-Q4_K_M-%05d-of-00002.gguf'%n)
+            gguf(path,{'general.name':'Grouped Fixture','general.file_type':15} if n==1 else {})
+            with path.open('ab') as f:f.write(b'0'*(3*1024*1024))
+        (self.store/'single.gguf').write_bytes(b'0'*(4*1024*1024))
+        out=self.run_audit('-ModelLimit 1' if os.name=='nt' else '--model-limit 1')
+        self.assertEqual(out.count('  Model set:'),1,out)
+        self.assertIn('large-Q4_K_M-*-of-00002.gguf',out)
+        self.assertIn('Shards: 2/2 present; complete filename set',out)
+        self.assertIn('size: 0.006 GiB',out)
+        self.assertIn('Grouped Fixture',out)
+        self.assertNotIn('large-Q4_K_M-00002-of-00002.gguf',out)
+        self.assertNotIn('  File:',out)
+
+    def test_missing_shards_and_distinct_sets(self):
+        for dirname in ('quant-a','quant-b'):
+            folder=self.store/dirname;folder.mkdir()
+            for n in (1,3):gguf(folder/('same-%05d-of-00003.gguf'%n),{'general.file_type':15})
+            gguf(folder/'mmproj-F16.gguf',{'general.type':'mmproj'})
+        folder=self.store/'tensors';folder.mkdir()
+        for n in (1,2):
+            header=json.dumps({'tensor':{'dtype':'F16','shape':[1],'data_offsets':[0,2]}}).encode()
+            (folder/('model-%05d-of-00002.safetensors'%n)).write_bytes(struct.pack('<Q',len(header))+header+b'00')
+        out=self.run_audit()
+        self.assertEqual(out.count('  Model set:'),3,out)
+        self.assertEqual(out.count('Shards: 2/3 present; missing: 00002'),2,out)
+        self.assertEqual(out.count('multimodal projector/encoder [GGUF]'),2,out)
+        self.assertIn('Shards: 2/2 present; complete filename set',out)
+        self.assertIn('Tensor dtypes: F16',out)
+
     @unittest.skipIf(os.name=='nt','Unix filename fallback')
     def test_no_python_filename_fallback(self):
         binpath=self.base/'bin';binpath.mkdir()
@@ -74,7 +105,18 @@ class ModelInventory(unittest.TestCase):
             target=shutil.which(name)
             if target:(binpath/name).symlink_to(target)
         (self.store/'mmproj-F16.gguf').write_bytes(b'fixture')
+        for n in (1,3):gguf(self.store/('split-%05d-of-00003.gguf'%n),{})
         self.env['PATH']=str(binpath)
-        self.assertIn('multimodal projector candidate [filename]',self.run_audit())
+        out=self.run_audit()
+        self.assertIn('multimodal projector candidate [filename]',out)
+        self.assertIn('Shards: 2/3 present; missing: 00002',out)
+        self.assertEqual(out.count('  Model set:'),1,out)
+
+    @unittest.skipUnless(os.name=='nt','Windows provider fallback')
+    def test_no_compiler_groups_shards(self):
+        for n in (1,2):gguf(self.store/('split-%05d-of-00002.gguf'%n),{})
+        out=self.run_audit(prefix="function Add-Type { throw 'fixture compiler unavailable' }; ")
+        self.assertIn('Shards: 2/2 present',out)
+        self.assertEqual(out.count('  Model set:'),1,out)
 
 if __name__=='__main__':unittest.main()

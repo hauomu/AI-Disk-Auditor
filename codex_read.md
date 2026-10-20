@@ -144,3 +144,27 @@ directory usage for sparse files.
 Format references: [GGUF specification](https://github.com/ggml-org/ggml/blob/master/docs/gguf.md),
 [llama.cpp metadata/file-type constants](https://github.com/ggml-org/llama.cpp/blob/master/gguf-py/gguf/constants.py),
 and [Ollama model manifest handling](https://github.com/ollama/ollama/blob/main/server/images.go).
+
+## Group sharded models in reports
+
+The default inventory now reports one model set for numbered
+`NAME-00001-of-000NN.gguf`, `.safetensors` and `.bin` files in the same directory.
+Different directory paths, prefixes, quantization names, total counts and formats
+remain separate. Projectors and MTP sidecars are not combined with base weights.
+Each set reports its filename pattern, discovered/expected count, missing indices,
+combined apparent size and one representative header file. Header parsing selects
+the lowest available shard; model limits and sorting apply after grouping.
+Filename completeness means the numbered parts were discovered, not that tensors
+or shard contents are valid. Sizes include only discovered parts; metadata and
+identity fields are not verified on every shard. Unnumbered files remain individual.
+
+Filename-only Linux fallback also groups shards and reports missing parts, but
+cannot provide combined sizes/header identity; Windows provider fallback groups
+and sums sizes without header identity. Fallback row limits retain their existing
+restrictions. Standard five-digit split naming is supported; arbitrary naming
+schemes and index-manifest-only shard associations are not guessed.
+
+Validation: native Linux 22 passed plus one Windows-only skip; Windows model suite
+five passed plus one Unix-only skip. Added checks cover group size/ranking before
+limits, missing parts, separate directories, safetensors sets, separate projectors
+and both dependency-restricted fallbacks. Existing script-block workflow remains.

@@ -299,6 +299,8 @@ inventory() {
   [ "$NO_INVENTORY" = true ] && return
   local i group path name role count=0
   local args=()
+  local shard_patterns=() shard_counts=() shard_expected=() shard_indices=()
+  local pattern index expected slot j missing present
   for ((i=0; i<${#SELECTED_PATHS[@]}; i++)); do
     group=${SELECTED_GROUPS[$i]}
     if [ "$group" = Caches ]; then
@@ -527,11 +529,35 @@ def enrich(item):
     item.update(quant=quant,publisher=publisher,repo=repo,dtype=dtype,note=note,arch=clean(meta.get('general.architecture',configs.get(str(path.parent/'config.json'),{}).get('model_type','unknown'))),mtp={k:v for k,v in meta.items() if k.endswith('.nextn_predict_layers')})
 
 print('\n=== Model files and sidecars ===')
-models=sorted((i for i in records.values() if i['model']),key=lambda i:i['size'],reverse=True)
+sets={}
+for item in (i for i in records.values() if i['model']):
+    path=Path(item['path'])
+    match=re.fullmatch(r'(.+)-(\d{5})-of-(\d{5})(\.(?:gguf|safetensors|bin))',path.name,re.I)
+    index=int(match[2]) if match else 0; expected=int(match[3]) if match else 0
+    if not (match and 1<=index<=expected):
+        sets[('file',item['actual'])]={'item':dict(item),'members':[item]}
+        continue
+    key=('set',str(path.parent),match[1],match[3],match[4])
+    if key not in sets:sets[key]={'item':dict(item),'members':[],'indices':set(),'expected':expected,'pattern':str(path.parent/(match[1]+'-*-of-'+match[3]+match[4])),'first':index}
+    group=sets[key];group['members'].append(item);group['indices'].add(index)
+    if index<group['first']:group['item']=dict(item);group['first']=index
+models=[]
+for group in sets.values():
+    item=group['item'];item['size']=sum(i['size'] for i in group['members'])
+    item['refs']=set().union(*(i['refs'] for i in group['members']))
+    item['shards']=group if 'expected' in group else None
+    models.append(item)
+models.sort(key=lambda i:i['size'],reverse=True)
 for item in models[:LIMIT]:
     enrich(item)
     if item['role']=='cached model blob candidate' and not item['refs'] and item['format']=='unknown':continue
-    print('\n  File: '+json.dumps(item['path'],ensure_ascii=False))
+    group=item['shards']
+    if group:
+        missing=[n for n in range(1,group['expected']+1) if n not in group['indices']]
+        print('\n  Model set: '+json.dumps(group['pattern'],ensure_ascii=False))
+        print('  Shards: %s/%s present; %s'%(len(group['indices']),group['expected'],'missing: '+','.join('%05d'%n for n in missing[:20])+(' ...' if len(missing)>20 else '') if missing else 'complete filename set'))
+        print('  Header file: '+json.dumps(item['path'],ensure_ascii=False))
+    else:print('\n  File: '+json.dumps(item['path'],ensure_ascii=False))
     print('  Role: '+item['role']+'; format: '+item['format']+'; size: %.3f GiB'%(item['size']/2**30))
     print('  Model: '+item.get('name',Path(item['path']).name)+'; architecture: '+item['arch'])
     print('  Quant: '+item['quant']+('; filename hint: '+item['hint']+' [inferred]' if item['hint'] else ''))
@@ -553,6 +579,7 @@ for issue in issues[:20]:print('  INVENTORY ISSUE: '+clean(issue))
 print('\nIdentity comes from bounded headers/manifests where available; filename/path roles are candidates.')
 print('Repository/uploader, model author and quantizer are distinct. Unknown fields remain unknown.')
 print('Per-file sizes are apparent lengths, which can exceed allocated disk use for sparse files.')
+print('Model-set sizes sum discovered shards. Filename completeness does not validate tensor contents.')
 print('No tensors are loaded, models hashed, services started, or gateway secrets read.')
 AI_AUDIT_METADATA_PY
     [ "$?" -eq 0 ] && return
@@ -571,14 +598,46 @@ AI_AUDIT_METADATA_PY
       *gateway*.py|*proxy*.py|*frontdoor*.py|*litellm*.py) role='gateway/frontend candidate' ;;
     esac
     [ -n "$role" ] || continue
+    if [[ "$name" =~ ^(.+)-([0-9]{5})-of-([0-9]{5})(\.(gguf|safetensors|bin))$ ]]; then
+      index=$((10#${BASH_REMATCH[2]})); expected=$((10#${BASH_REMATCH[3]}))
+      pattern="${path%/*}/${BASH_REMATCH[1]}-*-of-${BASH_REMATCH[3]}${BASH_REMATCH[4]}"
+      if [ "$index" -ge 1 ] && [ "$index" -le "$expected" ]; then
+        slot=-1
+        for ((j=0; j<${#shard_patterns[@]}; j++)); do [ "${shard_patterns[$j]}" = "$pattern" ] && slot=$j; done
+        if [ "$slot" -lt 0 ]; then
+          [ "$count" -ge "$MODEL_LIMIT" ] && continue
+          slot=${#shard_patterns[@]}; shard_patterns[$slot]=$pattern; shard_counts[$slot]=0; shard_expected[$slot]=$expected; shard_indices[$slot]='|'
+          count=$((count+1))
+        fi
+        shard_counts[$slot]=$((shard_counts[$slot]+1)); shard_indices[$slot]="${shard_indices[$slot]}$index|"
+        continue
+      fi
+    fi
+    [ "$count" -ge "$MODEL_LIMIT" ] && continue
     printf '  %s [filename]: %q\n' "$role" "$path"
     if [[ "$name" =~ (IQ[1-4]_[A-Za-z0-9_]+|Q[1-8]_[A-Za-z0-9_]+|BF16|F16|FP16|F32) ]]; then
       printf '    Quant filename hint: %s [inferred]; publisher: unknown\n' "${BASH_REMATCH[1]}"
     fi
-    count=$((count+1)); [ "$count" -ge "$MODEL_LIMIT" ] && { printf '  File row limit reached.\n'; break; }
+    count=$((count+1))
   done < <(for ((i=1; i<${#args[@]}; i+=2)); do
     find "${args[$i]}" -xdev \( -name .git -o -name node_modules -o -name .venv -o -name site-packages -o -name .ssh -o -name secrets -o -name credentials \) -prune -o -type f -print0 2>/dev/null
   done)
+  for ((j=0; j<${#shard_patterns[@]}; j++)); do
+    printf '  Model set: %q\n' "${shard_patterns[$j]}"
+    printf '  Shards: %s/%s present; ' "${shard_counts[$j]}" "${shard_expected[$j]}"
+    missing=0
+    for ((index=1; index<=${shard_expected[$j]}; index++)); do
+      case "${shard_indices[$j]}" in *"|$index|"*) ;; *)
+        [ "$missing" -eq 0 ] && printf 'missing: '
+        [ "$missing" -lt 20 ] && printf '%05d ' "$index"
+        missing=$((missing+1)) ;;
+      esac
+    done
+    [ "$missing" -eq 0 ] && printf 'complete filename set'
+    [ "$missing" -gt 20 ] && printf '...'
+    printf '\n  Header identity and total size unavailable in filename-only mode.\n'
+  done
+  [ "$count" -ge "$MODEL_LIMIT" ] && printf '  Model row limit reached; additional models may be omitted.\n'
 }
 runtime_context() {
   local tool path any=false

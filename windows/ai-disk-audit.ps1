@@ -280,8 +280,19 @@ function Add-AssetInventory($Lines,$Assets,[int]$Limit,[bool]$NativeAvailable) {
     $Lines.Add(''); $Lines.Add('=== Model files and sidecars ===')
     if (-not $NativeAvailable) {
         $Lines.Add('Header inspection unavailable; filename/path classification only.')
-        foreach($entry in @($Assets | Where-Object {$_.Kind -eq 'Model'} | Sort-Object Bytes -Descending | Select-Object -First $Limit)) {
-            $Lines.Add("  File: $($entry.Path)")
+        $fallbackSets=@{}
+        foreach($entry in @($Assets | Where-Object {$_.Kind -eq 'Model'})) {
+            $match=[regex]::Match($entry.Path,'(?i)^(.+)-(\d{5})-of-(\d{5})(\.(?:gguf|safetensors|bin))$')
+            $split=$match.Success -and [int]$match.Groups[2].Value -ge 1 -and [int]$match.Groups[2].Value -le [int]$match.Groups[3].Value
+            $key=if($split){$match.Groups[1].Value+'-*-of-'+$match.Groups[3].Value+$match.Groups[4].Value}else{$entry.Path}
+            if(-not $fallbackSets.ContainsKey($key)){$fallbackSets[$key]=[pscustomobject]@{Path=$key;Bytes=[long]0;Expected=0;Indices=(New-Object 'System.Collections.Generic.HashSet[int]')}}
+            $row=$fallbackSets[$key];$row.Bytes+=$entry.Bytes
+            if($split){$row.Expected=[int]$match.Groups[3].Value;[void]$row.Indices.Add([int]$match.Groups[2].Value)}
+        }
+        foreach($entry in @($fallbackSets.Values | Sort-Object Bytes -Descending | Select-Object -First $Limit)) {
+            $Lines.Add("  $(if($entry.Expected){'Model set'}else{'File'}): $($entry.Path)")
+            if($entry.Expected){$Lines.Add("  Shards: $($entry.Indices.Count)/$($entry.Expected) present; filename evidence only.")}
+            $Lines.Add('  Total apparent size: '+($entry.Bytes/1GB).ToString('F3',[Globalization.CultureInfo]::InvariantCulture)+' GiB')
             $Lines.Add('  Role/quant/publisher: unknown; native metadata reader unavailable.')
         }
         return
@@ -310,9 +321,24 @@ function Add-AssetInventory($Lines,$Assets,[int]$Limit,[bool]$NativeAvailable) {
         if(-not $models.ContainsKey($physical)){$models.Add($physical,$entry)}
         elseif([IO.Path]::GetExtension($models[$physical].Path) -eq '' -and [IO.Path]::GetExtension($entry.Path) -ne ''){$models[$physical]=$entry}
     }
+    $sets=@{}
+    foreach($pair in $models.GetEnumerator()) {
+        $candidate=$pair.Value
+        $match=[regex]::Match([IO.Path]::GetFileName($candidate.Path),'(?i)^(.+)-(\d{5})-of-(\d{5})(\.(?:gguf|safetensors|bin))$')
+        $index=0;$expected=0
+        if($match.Success){$index=[int]$match.Groups[2].Value;$expected=[int]$match.Groups[3].Value}
+        $split=$match.Success -and $index -ge 1 -and $index -le $expected
+        $pattern=if($split){[IO.Path]::Combine([IO.Path]::GetDirectoryName($candidate.Path),$match.Groups[1].Value+'-*-of-'+$match.Groups[3].Value+$match.Groups[4].Value)}else{''}
+        $key=if($split){'set:'+ $pattern}else{'file:'+ $pair.Key}
+        if(-not $sets.ContainsKey($key)){
+            $sets[$key]=[pscustomobject]@{Path=$candidate.Path;Bytes=[long]0;Expected=$expected;Pattern=$pattern;First=$index;Indices=(New-Object 'System.Collections.Generic.HashSet[int]');ReferenceKeys=(New-Object 'System.Collections.Generic.List[string]')}
+        }
+        $group=$sets[$key];$group.Bytes+=$candidate.Bytes;$group.ReferenceKeys.Add($pair.Key)
+        if($split){[void]$group.Indices.Add($index);if($index -lt $group.First){$group.Path=$candidate.Path;$group.First=$index}}
+    }
     $configCache=@{}; $shardCache=@{}; $shown=0
-    foreach($pair in @($models.GetEnumerator() | Sort-Object {$_.Value.Bytes} -Descending | Select-Object -First $Limit)) {
-        $entry=$pair.Value;$path=$entry.Path;$identity=[AiDiskAuditIdentityV1.Reader]::Inspect($path)
+    foreach($entry in @($sets.Values | Sort-Object Bytes -Descending | Select-Object -First $Limit)) {
+        $path=$entry.Path;$identity=[AiDiskAuditIdentityV1.Reader]::Inspect($path)
         $first=[regex]::Replace($path,'-\d{5}-of-(\d{5})\.gguf$','-00001-of-$1.gguf')
         if($first -ne $path -and [IO.File]::Exists($first) -and -not $identity.Meta.ContainsKey('general.file_type')) {
             if(-not $shardCache.ContainsKey($first)){$shardCache[$first]=[AiDiskAuditIdentityV1.Reader]::Inspect($first)}
@@ -333,7 +359,7 @@ function Add-AssetInventory($Lines,$Assets,[int]$Limit,[bool]$NativeAvailable) {
             }catch{$identity.Note='Invalid safetensors JSON header'}
             $identity.HeaderJson=''
         }
-        if(-not $identity.Format -and -not $references.ContainsKey($pair.Key)){continue}
+        if(-not $identity.Format -and -not @($entry.ReferenceKeys | Where-Object {$references.ContainsKey($_)}).Count){continue}
         $normal=$path.Replace('\','/')
         $match=[regex]::Match($normal,'models--([^/]+)')
         if($match.Success){$node=$match.Groups[1].Value;$split=$node.IndexOf('--');$repo=if($split -ge 0){$node.Substring(0,$split)+'/'+$node.Substring($split+2)}else{$node};$repo+=' [cache path; uploader, not verified publisher]'}
@@ -350,7 +376,15 @@ function Add-AssetInventory($Lines,$Assets,[int]$Limit,[bool]$NativeAvailable) {
             if($arch -eq 'unknown' -and $config.model_type){$arch=(Safe-IdentityText $config.model_type)+' [config]'}
         }
         $hint=[regex]::Match([IO.Path]::GetFileName($path),'(?i)(?:UD-)?(?:IQ[1-4]_[A-Z0-9_]+|Q[1-8](?:_[A-Z0-9]+)+|TQ[12]_0|BF16|F16|FP16|F32|FP32|FP8|MXFP4(?:_MOE)?|NVFP4)')
-        $Lines.Add('');$Lines.Add('  File: '+(Safe-IdentityText $path))
+        $Lines.Add('')
+        if($entry.Pattern){
+            $Lines.Add('  Model set: '+(Safe-IdentityText $entry.Pattern))
+            $missing=New-Object 'System.Collections.Generic.List[string]'
+            for($n=1;$n -le $entry.Expected -and $missing.Count -lt 20;$n++){if(-not $entry.Indices.Contains($n)){$missing.Add($n.ToString('D5'))}}
+            $status=if($missing.Count){'missing: '+($missing -join ',')+$(if($entry.Expected-$entry.Indices.Count -gt 20){' ...'}else{''})}else{'complete filename set'}
+            $Lines.Add("  Shards: $($entry.Indices.Count)/$($entry.Expected) present; $status")
+            $Lines.Add('  Header file: '+(Safe-IdentityText $path))
+        }else{$Lines.Add('  File: '+(Safe-IdentityText $path))}
         $Lines.Add('  Role: '+$identity.Role+'; format: '+$identity.Format+'; size: '+($entry.Bytes/1GB).ToString('F3',[Globalization.CultureInfo]::InvariantCulture)+' GiB')
         $Lines.Add('  Model: '+$modelName+'; architecture: '+$arch)
         $Lines.Add('  Quant: '+$quant+$(if($hint.Success){'; filename hint: '+$hint.Value+' [inferred]'}else{''}))
@@ -358,12 +392,13 @@ function Add-AssetInventory($Lines,$Assets,[int]$Limit,[bool]$NativeAvailable) {
         if($meta.ContainsKey('general.quantized_by')){$Lines.Add('  Quantizer: '+(Safe-IdentityText $meta['general.quantized_by'])+' [GGUF declared]')}
         foreach($key in $meta.Keys){if($key.EndsWith('.nextn_predict_layers')){$Lines.Add('  MTP capability: '+$key+'='+$meta[$key]+' [GGUF; not proof of a separate sidecar]')}}
         if($dtype){$Lines.Add('  Tensor dtypes: '+$dtype+' [header; not a quantization-method guarantee]')}
-        if($references.ContainsKey($pair.Key)){$Lines.Add('  Reference: '+$references[$pair.Key])}
+        foreach($key in $entry.ReferenceKeys){if($references.ContainsKey($key)){$Lines.Add('  Reference: '+$references[$key])}}
         if($identity.Note){$Lines.Add('  Metadata note: '+(Safe-IdentityText $identity.Note))}
         $shown++
     }
     if(-not $shown){$Lines.Add('  No recognized model files in selected locations. Add -Root for another store.')}
-    if($models.Count -gt $Limit){$Lines.Add("  Model rows limited to $Limit of $($models.Count) candidates; increase -ModelLimit.")}
+    if($sets.Count -gt $Limit){$Lines.Add("  Model rows limited to $Limit of $($sets.Count) models/sets; increase -ModelLimit.")}
+    $Lines.Add('Model-set sizes sum discovered shards. Filename completeness does not validate tensor contents.')
     $Lines.Add('');$Lines.Add('=== Backend/runtime files ===')
     $backendEntries=@($Assets | Where-Object {$_.Kind -eq 'Backend'} | Sort-Object Bytes -Descending)
     foreach($entry in @($backendEntries | Select-Object -First 100)) {
