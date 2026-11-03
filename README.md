@@ -290,3 +290,7 @@ Yes. The tool is read-only, so cancelling it will not damage anything.
 ## License
 
 MIT License.
+
+## License update: AI Disk Auditor License 1.0
+
+This version replaces the MIT License line above with the **AI Disk Auditor License 1.0**: MIT terms plus a restriction on scraping, text and data mining, and AI training. Using and modifying the tool, including commercially, stays allowed, and so does running it with an AI tool as long as its contents aren't kept or used for training. See `LICENSE` for the complete terms.
