@@ -1,7 +1,29 @@
-MIT License
+AI Disk Auditor License 1.0
 
-Copyright (c) 2026 AI Disk Auditor Contributors
+These are MIT terms with an added AI and data mining restriction. This is a
+source-available license, not an open-source license. Versions published
+earlier under the MIT License remain available under that license.
+
+Copyright (c) 2026 hauomu
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software.
+
+AI and Data Mining Restriction
+
+Unless you first obtain explicit written permission from hauomu, you may not:
+
+- scrape, harvest, or bulk-collect the Software; or
+- use the Software, or any part of it, for text and data mining, to train,
+  fine-tune, validate, or evaluate any machine learning or artificial
+  intelligence model, or as part of a dataset for those purposes.
+
+hauomu expressly reserves all rights against text and data mining, including
+under Article 4(3) of Directive (EU) 2019/790.
+
+This restriction does not limit ordinary viewing, forking, or cloning through
+GitHub as its Terms of Service allow, or search-engine indexing. It also does
+not stop you running the Software, or having an AI tool read or run it to do your own
+work, as long as its contents are not kept or used to train a model. It does
+not limit any right that applicable law does not allow a license to exclude.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
